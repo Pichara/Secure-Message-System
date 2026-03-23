@@ -1,0 +1,492 @@
+#include <httplib.h>
+#include <nlohmann/json.hpp>
+#include <pqxx/pqxx>
+#include <sodium.h>
+
+#include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <iomanip>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+using json = nlohmann::json;
+
+struct TokenInfo {
+  std::string username;
+  std::chrono::system_clock::time_point expires_at;
+};
+
+struct DbUser {
+  int id = 0;
+  std::string username;
+  std::string password_hash;
+  std::string public_key;
+  std::string encrypted_private_key;
+};
+
+std::string NowIso8601Utc() {
+  using namespace std::chrono;
+  auto now = system_clock::now();
+  auto tt = system_clock::to_time_t(now);
+  std::tm tm_utc{};
+#if defined(_WIN32)
+  gmtime_s(&tm_utc, &tt);
+#else
+  gmtime_r(&tt, &tm_utc);
+#endif
+  std::ostringstream oss;
+  oss << std::put_time(&tm_utc, "%Y-%m-%dT%H:%M:%SZ");
+  return oss.str();
+}
+
+std::string GetEnvOrDefault(const char* key, const char* fallback) {
+  const char* value = std::getenv(key);
+  if (value && *value) {
+    return std::string(value);
+  }
+  return std::string(fallback);
+}
+
+std::string GetDbUrl() {
+  return GetEnvOrDefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/secure_message");
+}
+
+std::string GenerateToken() {
+  std::array<unsigned char, 32> bytes{};
+  randombytes_buf(bytes.data(), bytes.size());
+  static const char* kHex = "0123456789abcdef";
+  std::string out;
+  out.reserve(bytes.size() * 2);
+  for (unsigned char b : bytes) {
+    out.push_back(kHex[b >> 4]);
+    out.push_back(kHex[b & 0x0f]);
+  }
+  return out;
+}
+
+std::optional<std::string> ValidateToken(const httplib::Request& req,
+                                         std::unordered_map<std::string, TokenInfo>& tokens,
+                                         std::mutex& token_mu) {
+  auto auth = req.get_header_value("Authorization");
+  const std::string prefix = "Bearer ";
+  if (auth.rfind(prefix, 0) != 0) {
+    return std::nullopt;
+  }
+  std::string token = auth.substr(prefix.size());
+  auto now = std::chrono::system_clock::now();
+
+  std::lock_guard<std::mutex> lock(token_mu);
+  auto it = tokens.find(token);
+  if (it == tokens.end()) {
+    return std::nullopt;
+  }
+  if (it->second.expires_at < now) {
+    tokens.erase(it);
+    return std::nullopt;
+  }
+  return it->second.username;
+}
+
+void EnsureSchema(pqxx::connection& conn) {
+  pqxx::work txn(conn);
+  txn.exec(R"(
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      public_key TEXT NOT NULL,
+      encrypted_private_key TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  )");
+
+  txn.exec(R"(
+    CREATE TABLE IF NOT EXISTS messages (
+      id SERIAL PRIMARY KEY,
+      sender_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      recipient_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      encrypted_key TEXT NOT NULL,
+      ciphertext TEXT NOT NULL,
+      iv TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  )");
+
+  txn.commit();
+}
+
+std::optional<DbUser> GetUserByUsername(pqxx::connection& conn, const std::string& username) {
+  pqxx::work txn(conn);
+  pqxx::result r = txn.exec_params(
+      "SELECT id, username, password_hash, public_key, encrypted_private_key FROM users WHERE username = $1",
+      username);
+  txn.commit();
+  if (r.empty()) {
+    return std::nullopt;
+  }
+  DbUser user;
+  user.id = r[0][0].as<int>();
+  user.username = r[0][1].as<std::string>();
+  user.password_hash = r[0][2].as<std::string>();
+  user.public_key = r[0][3].as<std::string>();
+  user.encrypted_private_key = r[0][4].as<std::string>();
+  return user;
+}
+
+int main() {
+  if (sodium_init() < 0) {
+    std::fprintf(stderr, "Failed to initialize libsodium.\n");
+    return 1;
+  }
+
+  try {
+    pqxx::connection conn(GetDbUrl());
+    EnsureSchema(conn);
+  } catch (const std::exception& ex) {
+    std::fprintf(stderr, "Database init failed: %s\n", ex.what());
+    return 1;
+  }
+
+  httplib::Server server;
+
+  std::mutex token_mu;
+  std::unordered_map<std::string, TokenInfo> tokens;
+
+  server.set_default_headers({
+      {"Access-Control-Allow-Origin", "*"},
+      {"Access-Control-Allow-Headers", "Content-Type, Authorization"},
+      {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
+  });
+
+  server.Options(R"(/api/.*)", [](const httplib::Request&, httplib::Response& res) {
+    res.status = 204;
+  });
+
+  server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+    json out = { {"status", "ok"} };
+    res.set_content(out.dump(), "application/json");
+  });
+
+  server.Post("/api/register", [&](const httplib::Request& req, httplib::Response& res) {
+    json body;
+    try {
+      body = json::parse(req.body);
+    } catch (...) {
+      res.status = 400;
+      res.set_content("{\"error\":\"invalid_json\"}", "application/json");
+      return;
+    }
+
+    const std::string username = body.value("username", "");
+    const std::string password = body.value("password", "");
+    const std::string public_key = body.value("public_key", "");
+    const std::string encrypted_private_key = body.value("encrypted_private_key", "");
+
+    if (username.empty() || password.empty() || public_key.empty() || encrypted_private_key.empty()) {
+      res.status = 400;
+      res.set_content("{\"error\":\"missing_fields\"}", "application/json");
+      return;
+    }
+
+    char hash[crypto_pwhash_STRBYTES];
+    if (crypto_pwhash_str(
+            hash,
+            password.c_str(),
+            password.size(),
+            crypto_pwhash_OPSLIMIT_MODERATE,
+            crypto_pwhash_MEMLIMIT_MODERATE) != 0) {
+      res.status = 500;
+      res.set_content("{\"error\":\"hash_failed\"}", "application/json");
+      return;
+    }
+
+    try {
+      pqxx::connection conn(GetDbUrl());
+      auto existing = GetUserByUsername(conn, username);
+      if (existing.has_value()) {
+        res.status = 409;
+        res.set_content("{\"error\":\"user_exists\"}", "application/json");
+        return;
+      }
+
+      pqxx::work txn(conn);
+      txn.exec_params(
+          "INSERT INTO users (username, password_hash, public_key, encrypted_private_key) VALUES ($1, $2, $3, $4)",
+          username,
+          std::string(hash),
+          public_key,
+          encrypted_private_key);
+      txn.commit();
+
+      res.status = 201;
+      res.set_content("{\"status\":\"registered\"}", "application/json");
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr, "Register DB error: %s\n", ex.what());
+      res.status = 500;
+      res.set_content("{\"error\":\"db_error\"}", "application/json");
+    }
+  });
+
+  server.Post("/api/login", [&](const httplib::Request& req, httplib::Response& res) {
+    json body;
+    try {
+      body = json::parse(req.body);
+    } catch (...) {
+      res.status = 400;
+      res.set_content("{\"error\":\"invalid_json\"}", "application/json");
+      return;
+    }
+
+    const std::string username = body.value("username", "");
+    const std::string password = body.value("password", "");
+
+    if (username.empty() || password.empty()) {
+      res.status = 400;
+      res.set_content("{\"error\":\"missing_fields\"}", "application/json");
+      return;
+    }
+
+    try {
+      pqxx::connection conn(GetDbUrl());
+      auto user = GetUserByUsername(conn, username);
+      if (!user.has_value()) {
+        res.status = 401;
+        res.set_content("{\"error\":\"invalid_credentials\"}", "application/json");
+        return;
+      }
+
+      if (crypto_pwhash_str_verify(user->password_hash.c_str(), password.c_str(), password.size()) != 0) {
+        res.status = 401;
+        res.set_content("{\"error\":\"invalid_credentials\"}", "application/json");
+        return;
+      }
+
+      std::string token = GenerateToken();
+      auto expires_at = std::chrono::system_clock::now() + std::chrono::hours(1);
+      {
+        std::lock_guard<std::mutex> lock(token_mu);
+        tokens[token] = TokenInfo{username, expires_at};
+      }
+
+      json out = { {"token", token}, {"expires_in", 3600} };
+      res.set_content(out.dump(), "application/json");
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr, "Login DB error: %s\n", ex.what());
+      res.status = 500;
+      res.set_content("{\"error\":\"db_error\"}", "application/json");
+    }
+  });
+
+  server.Get("/api/me", [&](const httplib::Request& req, httplib::Response& res) {
+    auto auth_user = ValidateToken(req, tokens, token_mu);
+    if (!auth_user.has_value()) {
+      res.status = 401;
+      res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+      return;
+    }
+
+    try {
+      pqxx::connection conn(GetDbUrl());
+      auto user = GetUserByUsername(conn, *auth_user);
+      if (!user.has_value()) {
+        res.status = 404;
+        res.set_content("{\"error\":\"user_not_found\"}", "application/json");
+        return;
+      }
+
+      json out = {
+          {"username", user->username},
+          {"public_key", user->public_key},
+          {"encrypted_private_key", user->encrypted_private_key}
+      };
+      res.set_content(out.dump(), "application/json");
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr, "Me DB error: %s\n", ex.what());
+      res.status = 500;
+      res.set_content("{\"error\":\"db_error\"}", "application/json");
+    }
+  });
+
+  server.Get(R"(/api/users/(.*)/public-key)", [&](const httplib::Request& req, httplib::Response& res) {
+    auto auth_user = ValidateToken(req, tokens, token_mu);
+    if (!auth_user.has_value()) {
+      res.status = 401;
+      res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+      return;
+    }
+
+    std::string username = req.matches[1];
+    try {
+      pqxx::connection conn(GetDbUrl());
+      auto user = GetUserByUsername(conn, username);
+      if (!user.has_value()) {
+        res.status = 404;
+        res.set_content("{\"error\":\"user_not_found\"}", "application/json");
+        return;
+      }
+
+      json out = { {"username", username}, {"public_key", user->public_key} };
+      res.set_content(out.dump(), "application/json");
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr, "Public key DB error: %s\n", ex.what());
+      res.status = 500;
+      res.set_content("{\"error\":\"db_error\"}", "application/json");
+    }
+  });
+
+  server.Post("/api/messages", [&](const httplib::Request& req, httplib::Response& res) {
+    auto auth_user = ValidateToken(req, tokens, token_mu);
+    if (!auth_user.has_value()) {
+      res.status = 401;
+      res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+      return;
+    }
+
+    json body;
+    try {
+      body = json::parse(req.body);
+    } catch (...) {
+      res.status = 400;
+      res.set_content("{\"error\":\"invalid_json\"}", "application/json");
+      return;
+    }
+
+    const std::string recipient = body.value("recipient", "");
+    const std::string encrypted_key = body.value("encrypted_key", "");
+    const std::string ciphertext = body.value("ciphertext", "");
+    const std::string iv = body.value("iv", "");
+
+    if (recipient.empty() || encrypted_key.empty() || ciphertext.empty() || iv.empty()) {
+      res.status = 400;
+      res.set_content("{\"error\":\"missing_fields\"}", "application/json");
+      return;
+    }
+
+    try {
+      pqxx::connection conn(GetDbUrl());
+      auto sender = GetUserByUsername(conn, *auth_user);
+      auto recipient_user = GetUserByUsername(conn, recipient);
+      if (!sender.has_value() || !recipient_user.has_value()) {
+        res.status = 404;
+        res.set_content("{\"error\":\"recipient_not_found\"}", "application/json");
+        return;
+      }
+
+      pqxx::work txn(conn);
+      pqxx::result r = txn.exec_params(
+          "INSERT INTO messages (sender_id, recipient_id, encrypted_key, ciphertext, iv) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+          sender->id,
+          recipient_user->id,
+          encrypted_key,
+          ciphertext,
+          iv);
+      txn.commit();
+
+      json out = { {"status", "stored"}, {"id", r[0][0].as<int>()} };
+      res.status = 201;
+      res.set_content(out.dump(), "application/json");
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr, "Message insert DB error: %s\n", ex.what());
+      res.status = 500;
+      res.set_content("{\"error\":\"db_error\"}", "application/json");
+    }
+  });
+
+  server.Get("/api/messages", [&](const httplib::Request& req, httplib::Response& res) {
+    auto auth_user = ValidateToken(req, tokens, token_mu);
+    if (!auth_user.has_value()) {
+      res.status = 401;
+      res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+      return;
+    }
+
+    std::string with_user = req.get_param_value("with");
+
+    try {
+      pqxx::connection conn(GetDbUrl());
+      auto me = GetUserByUsername(conn, *auth_user);
+      if (!me.has_value()) {
+        res.status = 401;
+        res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+        return;
+      }
+
+      std::optional<int> with_id;
+      if (!with_user.empty()) {
+        auto other = GetUserByUsername(conn, with_user);
+        if (!other.has_value()) {
+          res.status = 404;
+          res.set_content("{\"error\":\"user_not_found\"}", "application/json");
+          return;
+        }
+        with_id = other->id;
+      }
+
+      pqxx::work txn(conn);
+      pqxx::result r;
+      if (with_id.has_value()) {
+        r = txn.exec_params(
+            "SELECT m.id, su.username, ru.username, m.encrypted_key, m.ciphertext, m.iv, m.created_at "
+            "FROM messages m "
+            "JOIN users su ON m.sender_id = su.id "
+            "JOIN users ru ON m.recipient_id = ru.id "
+            "WHERE (m.sender_id = $1 AND m.recipient_id = $2) OR (m.sender_id = $2 AND m.recipient_id = $1) "
+            "ORDER BY m.created_at ASC",
+            me->id,
+            *with_id);
+      } else {
+        r = txn.exec_params(
+            "SELECT m.id, su.username, ru.username, m.encrypted_key, m.ciphertext, m.iv, m.created_at "
+            "FROM messages m "
+            "JOIN users su ON m.sender_id = su.id "
+            "JOIN users ru ON m.recipient_id = ru.id "
+            "WHERE m.sender_id = $1 OR m.recipient_id = $1 "
+            "ORDER BY m.created_at ASC",
+            me->id);
+      }
+      txn.commit();
+
+      json out = json::array();
+      for (const auto& row : r) {
+        out.push_back({
+            {"id", row[0].as<int>()},
+            {"sender", row[1].as<std::string>()},
+            {"recipient", row[2].as<std::string>()},
+            {"encrypted_key", row[3].as<std::string>()},
+            {"ciphertext", row[4].as<std::string>()},
+            {"iv", row[5].as<std::string>()},
+            {"created_at", row[6].as<std::string>()}
+        });
+      }
+      res.set_content(out.dump(), "application/json");
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr, "Message list DB error: %s\n", ex.what());
+      res.status = 500;
+      res.set_content("{\"error\":\"db_error\"}", "application/json");
+    }
+  });
+
+  const char* host = "0.0.0.0";
+  int port = 8080;
+  if (const char* env_port = std::getenv("PORT")) {
+    try {
+      int parsed = std::stoi(env_port);
+      if (parsed > 0 && parsed < 65536) {
+        port = parsed;
+      }
+    } catch (...) {
+      // Ignore invalid PORT values.
+    }
+  }
+
+  std::printf("Secure Message Backend listening on %s:%d\n", host, port);
+  server.listen(host, port);
+  return 0;
+}

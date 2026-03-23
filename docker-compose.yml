@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:16
+    container_name: secure-message-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: secure_message
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+    container_name: secure-message-backend
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/secure_message
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
