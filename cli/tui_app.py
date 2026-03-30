@@ -483,7 +483,6 @@ class MessageScreen(Screen):
             for index, item in enumerate(list_view.children):
                 if getattr(item, "user", None) == username:
                     list_view.index = index
-                    list_view.scroll_to_item(item)
                     break
 
             self.current_with = username
