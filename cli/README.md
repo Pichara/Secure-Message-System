@@ -28,7 +28,17 @@ python secure_message_cli.py config set-history off
 ```powershell
 python secure_message_cli.py
 ```
-This opens a login/register menu. After login, it opens a new terminal window for the session menu.
+This opens the full-screen TUI by default. Use arrow keys and Enter to navigate.
+
+Open the TUI explicitly:
+```powershell
+python secure_message_cli.py tui
+```
+
+Open the legacy menu launcher:
+```powershell
+python secure_message_cli.py launcher
+```
 
 ## Register
 ```powershell

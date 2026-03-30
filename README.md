@@ -23,6 +23,7 @@ Academic secure messaging project with **end-to-end encryption (E2EE)** and expl
 ## Architecture (High Level)
 - **Clients (Web/CLI)** → **Backend API** → **PostgreSQL**
 - API handles auth, public key lookup, and message storage (ciphertext only).
+- CLI defaults to a Textual TUI for messaging workflows.
 
 ## API (Current)
 1. `GET /health`
@@ -54,4 +55,4 @@ Academic secure messaging project with **end-to-end encryption (E2EE)** and expl
 ## Stack (Reference)
 - Backend: C++ (cpp‑httplib, nlohmann/json, libpqxx, libsodium)
 - DB: PostgreSQL
-- CLI: Python (Typer, Requests, Cryptography)
+- CLI: Python (Typer, Requests, Cryptography, Textual)

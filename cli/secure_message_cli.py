@@ -577,10 +577,27 @@ def _safe_call(func, *args) -> bool:
         return False
 
 
+def _run_tui() -> bool:
+    try:
+        from tui_app import run_tui
+    except Exception as exc:
+        typer.secho(f"TUI unavailable: {exc}", fg=typer.colors.YELLOW)
+        return False
+    run_tui()
+    return True
+
+
 @app.callback(invoke_without_command=True)
 def main(ctx: typer.Context):
     if ctx.invoked_subcommand is None:
-        launcher()
+        if not _run_tui():
+            launcher()
+
+
+@app.command()
+def tui():
+    if not _run_tui():
+        raise typer.Exit(1)
 
 
 @app.command()

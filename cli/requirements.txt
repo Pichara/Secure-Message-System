@@ -4,3 +4,4 @@ cryptography==42.0.8
 click==8.1.7
 prompt_toolkit==3.0.47
 rich==13.7.1
+textual==0.59.0
