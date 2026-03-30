@@ -4,6 +4,7 @@
 #include <sodium.h>
 
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -71,15 +72,23 @@ std::string GenerateToken() {
   return out;
 }
 
-std::optional<std::string> ValidateToken(const httplib::Request& req,
-                                         std::unordered_map<std::string, TokenInfo>& tokens,
-                                         std::mutex& token_mu) {
+std::optional<std::string> ExtractBearerToken(const httplib::Request& req) {
   auto auth = req.get_header_value("Authorization");
   const std::string prefix = "Bearer ";
   if (auth.rfind(prefix, 0) != 0) {
     return std::nullopt;
   }
-  std::string token = auth.substr(prefix.size());
+  return auth.substr(prefix.size());
+}
+
+std::optional<std::string> ValidateToken(const httplib::Request& req,
+                                         std::unordered_map<std::string, TokenInfo>& tokens,
+                                         std::mutex& token_mu) {
+  auto token_opt = ExtractBearerToken(req);
+  if (!token_opt.has_value()) {
+    return std::nullopt;
+  }
+  std::string token = *token_opt;
   auto now = std::chrono::system_clock::now();
 
   std::lock_guard<std::mutex> lock(token_mu);
@@ -159,10 +168,14 @@ int main() {
   std::mutex token_mu;
   std::unordered_map<std::string, TokenInfo> tokens;
 
+  std::string cors_origin = GetEnvOrDefault("CORS_ORIGIN", "*");
   server.set_default_headers({
-      {"Access-Control-Allow-Origin", "*"},
+      {"Access-Control-Allow-Origin", cors_origin},
       {"Access-Control-Allow-Headers", "Content-Type, Authorization"},
       {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
+      {"Access-Control-Max-Age", "86400"},
+      {"Cache-Control", "no-store"},
+      {"X-Content-Type-Options", "nosniff"},
   });
 
   server.Options(R"(/api/.*)", [](const httplib::Request&, httplib::Response& res) {
@@ -282,6 +295,29 @@ int main() {
       res.status = 500;
       res.set_content("{\"error\":\"db_error\"}", "application/json");
     }
+  });
+
+  server.Post("/api/logout", [&](const httplib::Request& req, httplib::Response& res) {
+    auto token_opt = ExtractBearerToken(req);
+    if (!token_opt.has_value()) {
+      res.status = 401;
+      res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+      return;
+    }
+
+    auto now = std::chrono::system_clock::now();
+    std::lock_guard<std::mutex> lock(token_mu);
+    auto it = tokens.find(*token_opt);
+    if (it == tokens.end() || it->second.expires_at < now) {
+      if (it != tokens.end()) {
+        tokens.erase(it);
+      }
+      res.status = 401;
+      res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+      return;
+    }
+    tokens.erase(it);
+    res.set_content("{\"status\":\"logged_out\"}", "application/json");
   });
 
   server.Get("/api/me", [&](const httplib::Request& req, httplib::Response& res) {
@@ -408,6 +444,35 @@ int main() {
     }
 
     std::string with_user = req.get_param_value("with");
+    std::string order = req.get_param_value("order");
+    std::string before_id_param = req.get_param_value("before_id");
+    std::string limit_param = req.get_param_value("limit");
+    std::string order_sql = "ASC";
+    if (order == "desc") {
+      order_sql = "DESC";
+    }
+    int limit = 200;
+    if (!limit_param.empty()) {
+      try {
+        int parsed = std::stoi(limit_param);
+        if (parsed > 0) {
+          limit = std::min(parsed, 200);
+        }
+      } catch (...) {
+        // Ignore invalid limit.
+      }
+    }
+    std::optional<int> before_id;
+    if (!before_id_param.empty()) {
+      try {
+        int parsed = std::stoi(before_id_param);
+        if (parsed > 0) {
+          before_id = parsed;
+        }
+      } catch (...) {
+        // Ignore invalid before_id.
+      }
+    }
 
     try {
       pqxx::connection conn(GetDbUrl());
@@ -432,24 +497,59 @@ int main() {
       pqxx::work txn(conn);
       pqxx::result r;
       if (with_id.has_value()) {
-        r = txn.exec_params(
-            "SELECT m.id, su.username, ru.username, m.encrypted_key, m.ciphertext, m.iv, m.created_at "
-            "FROM messages m "
-            "JOIN users su ON m.sender_id = su.id "
-            "JOIN users ru ON m.recipient_id = ru.id "
-            "WHERE (m.sender_id = $1 AND m.recipient_id = $2) OR (m.sender_id = $2 AND m.recipient_id = $1) "
-            "ORDER BY m.created_at ASC",
-            me->id,
-            *with_id);
+        if (before_id.has_value()) {
+          r = txn.exec_params(
+              "SELECT m.id, su.username, ru.username, m.encrypted_key, m.ciphertext, m.iv, m.created_at "
+              "FROM messages m "
+              "JOIN users su ON m.sender_id = su.id "
+              "JOIN users ru ON m.recipient_id = ru.id "
+              "WHERE ((m.sender_id = $1 AND m.recipient_id = $2) OR (m.sender_id = $2 AND m.recipient_id = $1)) "
+              "AND m.id < $3 "
+              "ORDER BY m.created_at " + order_sql + ", m.id " + order_sql + " "
+              "LIMIT $4",
+              me->id,
+              *with_id,
+              *before_id,
+              limit);
+        } else {
+          r = txn.exec_params(
+              "SELECT m.id, su.username, ru.username, m.encrypted_key, m.ciphertext, m.iv, m.created_at "
+              "FROM messages m "
+              "JOIN users su ON m.sender_id = su.id "
+              "JOIN users ru ON m.recipient_id = ru.id "
+              "WHERE (m.sender_id = $1 AND m.recipient_id = $2) OR (m.sender_id = $2 AND m.recipient_id = $1) "
+              "ORDER BY m.created_at " + order_sql + ", m.id " + order_sql + " "
+              "LIMIT $3",
+              me->id,
+              *with_id,
+              limit);
+        }
       } else {
-        r = txn.exec_params(
-            "SELECT m.id, su.username, ru.username, m.encrypted_key, m.ciphertext, m.iv, m.created_at "
-            "FROM messages m "
-            "JOIN users su ON m.sender_id = su.id "
-            "JOIN users ru ON m.recipient_id = ru.id "
-            "WHERE m.sender_id = $1 OR m.recipient_id = $1 "
-            "ORDER BY m.created_at ASC",
-            me->id);
+        if (before_id.has_value()) {
+          r = txn.exec_params(
+              "SELECT m.id, su.username, ru.username, m.encrypted_key, m.ciphertext, m.iv, m.created_at "
+              "FROM messages m "
+              "JOIN users su ON m.sender_id = su.id "
+              "JOIN users ru ON m.recipient_id = ru.id "
+              "WHERE (m.sender_id = $1 OR m.recipient_id = $1) "
+              "AND m.id < $2 "
+              "ORDER BY m.created_at " + order_sql + ", m.id " + order_sql + " "
+              "LIMIT $3",
+              me->id,
+              *before_id,
+              limit);
+        } else {
+          r = txn.exec_params(
+              "SELECT m.id, su.username, ru.username, m.encrypted_key, m.ciphertext, m.iv, m.created_at "
+              "FROM messages m "
+              "JOIN users su ON m.sender_id = su.id "
+              "JOIN users ru ON m.recipient_id = ru.id "
+              "WHERE m.sender_id = $1 OR m.recipient_id = $1 "
+              "ORDER BY m.created_at " + order_sql + ", m.id " + order_sql + " "
+              "LIMIT $2",
+              me->id,
+              limit);
+        }
       }
       txn.commit();
 

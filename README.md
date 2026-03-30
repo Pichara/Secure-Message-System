@@ -24,6 +24,21 @@ Academic secure messaging project with **end-to-end encryption (E2EE)** and expl
 - **Clients (Web/CLI)** → **Backend API** → **PostgreSQL**
 - API handles auth, public key lookup, and message storage (ciphertext only).
 
+## API (Current)
+1. `GET /health`
+2. `POST /api/register`
+3. `POST /api/login`
+4. `POST /api/logout`
+5. `GET /api/me`
+6. `GET /api/users/{username}/public-key`
+7. `POST /api/messages`
+8. `GET /api/messages`
+   - Optional query params: `with`, `limit`, `order` (`asc|desc`), `before_id`
+
+## API Notes
+- CORS defaults to `*` and can be overridden with `CORS_ORIGIN`.
+- Responses are JSON; errors use `{"error":"..."}`.
+
 ## Stack (Reference)
 - Backend: C++ (cpp‑httplib, nlohmann/json, libpqxx, libsodium)
 - DB: PostgreSQL
