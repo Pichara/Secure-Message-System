@@ -445,6 +445,14 @@ class MessageScreen(Screen):
         event.input.value = ""
         self._render_conversation(self.current_with)
 
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "new-chat":
+            await self.action_new_chat()
+            return
+        if event.button.id == "refresh":
+            self.action_refresh()
+            return
+
     async def action_new_chat(self) -> None:
         while True:
             username = await self.app.push_screen(InputDialog("Start chat with:", "username"), wait_for_dismiss=True)
