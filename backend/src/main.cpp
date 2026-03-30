@@ -244,6 +244,173 @@ bool ApplyCors(const httplib::Request& req, httplib::Response& res, const CorsCo
   return true;
 }
 
+std::string BuildOpenApiSpec() {
+  static const std::string spec = R"JSON({
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Secure Message API",
+    "version": "1.0.0",
+    "description": "Backend API for the Secure Message System."
+  },
+  "servers": [
+    { "url": "http://localhost:8080" }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": { "application/json": { "example": { "status": "ok" } } }
+          }
+        }
+      }
+    },
+    "/api/register": {
+      "post": {
+        "summary": "Register user",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["username", "password", "public_key", "encrypted_private_key"],
+                "properties": {
+                  "username": { "type": "string" },
+                  "password": { "type": "string" },
+                  "public_key": { "type": "string" },
+                  "encrypted_private_key": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Registered" },
+          "400": { "description": "Invalid request" },
+          "409": { "description": "User exists" }
+        }
+      }
+    },
+    "/api/login": {
+      "post": {
+        "summary": "Login user",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["username", "password"],
+                "properties": {
+                  "username": { "type": "string" },
+                  "password": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Token issued" },
+          "401": { "description": "Invalid credentials" }
+        }
+      }
+    },
+    "/api/logout": {
+      "post": {
+        "summary": "Logout user",
+        "security": [ { "bearerAuth": [] } ],
+        "responses": {
+          "200": { "description": "Logged out" },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
+    "/api/me": {
+      "get": {
+        "summary": "Current user info",
+        "security": [ { "bearerAuth": [] } ],
+        "responses": {
+          "200": { "description": "User details" },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
+    "/api/users/{username}/public-key": {
+      "get": {
+        "summary": "Get public key by username",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Public key" },
+          "404": { "description": "User not found" }
+        }
+      }
+    },
+    "/api/messages": {
+      "post": {
+        "summary": "Send message",
+        "security": [ { "bearerAuth": [] } ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["recipient", "encrypted_key", "ciphertext", "iv"],
+                "properties": {
+                  "recipient": { "type": "string" },
+                  "encrypted_key": { "type": "string" },
+                  "ciphertext": { "type": "string" },
+                  "iv": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Stored" },
+          "401": { "description": "Unauthorized" }
+        }
+      },
+      "get": {
+        "summary": "List messages",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [
+          { "name": "with", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
+          { "name": "order", "in": "query", "schema": { "type": "string", "enum": ["asc", "desc"] } },
+          { "name": "before_id", "in": "query", "schema": { "type": "integer" } }
+        ],
+        "responses": {
+          "200": { "description": "Messages list" },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    }
+  }
+})JSON";
+  return spec;
+}
+
 void EnsureSchema(pqxx::connection& conn) {
   pqxx::work txn(conn);
   txn.exec(R"(
@@ -339,6 +506,56 @@ int main() {
       return;
     }
     res.status = 204;
+  });
+
+  server.Get("/openapi.json", [&](const httplib::Request& req, httplib::Response& res) {
+    if (!ApplyCors(req, res, cors)) {
+      res.status = 403;
+      res.set_content("{\"error\":\"cors_denied\"}", "application/json");
+      return;
+    }
+    res.set_content(BuildOpenApiSpec(), "application/json");
+  });
+
+  server.Get("/api/docs", [&](const httplib::Request& req, httplib::Response& res) {
+    if (!ApplyCors(req, res, cors)) {
+      res.status = 403;
+      res.set_content("{\"error\":\"cors_denied\"}", "application/json");
+      return;
+    }
+    const std::string html = R"HTML(
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8"/>
+    <title>Secure Message API Docs</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 2rem; line-height: 1.5; }
+      code { background: #f3f3f3; padding: 2px 6px; border-radius: 4px; }
+      h1 { margin-bottom: 0.5rem; }
+      .muted { color: #666; }
+      ul { margin-top: 0.5rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Secure Message API</h1>
+    <div class="muted">OpenAPI spec: <a href="/openapi.json">/openapi.json</a></div>
+    <h2>Endpoints</h2>
+    <ul>
+      <li><code>GET /health</code></li>
+      <li><code>POST /api/register</code></li>
+      <li><code>POST /api/login</code></li>
+      <li><code>POST /api/logout</code></li>
+      <li><code>GET /api/me</code></li>
+      <li><code>GET /api/users/{username}/public-key</code></li>
+      <li><code>POST /api/messages</code></li>
+      <li><code>GET /api/messages</code> (with, limit, order, before_id)</li>
+    </ul>
+    <p>Protected endpoints require <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+  </body>
+</html>
+)HTML";
+    res.set_content(html, "text/html");
   });
 
   server.Get("/health", [&](const httplib::Request& req, httplib::Response& res) {

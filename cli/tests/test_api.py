@@ -47,6 +47,21 @@ def _login(username: str, password: str) -> str:
 
 
 @pytest.mark.e2e
+def test_api_docs_available():
+    if not _health_check():
+        pytest.skip("Backend is not reachable")
+
+    resp = requests.get(f"{BACKEND_URL}/openapi.json", timeout=10)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data.get("openapi") is not None
+
+    resp = requests.get(f"{BACKEND_URL}/api/docs", timeout=10)
+    assert resp.status_code == 200
+    assert "openapi" in resp.text.lower()
+
+
+@pytest.mark.e2e
 def test_api_auth_and_logout():
     if not _health_check():
         pytest.skip("Backend is not reachable")

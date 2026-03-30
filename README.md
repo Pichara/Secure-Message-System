@@ -26,19 +26,22 @@ Academic secure messaging project with **end-to-end encryption (E2EE)** and expl
 
 ## API (Current)
 1. `GET /health`
-2. `POST /api/register`
-3. `POST /api/login`
-4. `POST /api/logout`
-5. `GET /api/me`
-6. `GET /api/users/{username}/public-key`
-7. `POST /api/messages`
-8. `GET /api/messages`
+2. `GET /openapi.json`
+3. `GET /api/docs`
+4. `POST /api/register`
+5. `POST /api/login`
+6. `POST /api/logout`
+7. `GET /api/me`
+8. `GET /api/users/{username}/public-key`
+9. `POST /api/messages`
+10. `GET /api/messages`
    - Optional query params: `with`, `limit`, `order` (`asc|desc`), `before_id`
 
 ## API Notes
 - CORS defaults to `*` and can be overridden with `CORS_ORIGIN`.
 - Responses are JSON; errors use `{"error":"..."}`.
 - `order` and `before_id` operate on message IDs for stable pagination.
+- OpenAPI spec available at `/openapi.json` and human-friendly docs at `/api/docs`.
 
 ## Security Controls (Additional)
 - Input validation with bounded username/password lengths and allowed characters.
