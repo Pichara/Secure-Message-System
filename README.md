@@ -25,6 +25,16 @@ Academic secure messaging project with **end-to-end encryption (E2EE)** and expl
 - API handles auth, public key lookup, and message storage (ciphertext only).
 - CLI defaults to a Textual TUI for messaging workflows.
 
+## CLI Quickstart (TUI)
+```powershell
+python secure_message_cli.py
+```
+TUI hotkeys:
+- `n` new chat
+- `r` refresh contacts
+- `u` unlock inbox (decrypt)
+- `l` logout
+
 ## API (Current)
 1. `GET /health`
 2. `GET /openapi.json`

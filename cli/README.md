@@ -40,10 +40,17 @@ Open the legacy menu launcher:
 python secure_message_cli.py launcher
 ```
 
+TUI hotkeys:
+- `n` new chat (adds user to Contacts if found)
+- `r` refresh contacts
+- `u` unlock inbox (decrypt received messages)
+- `l` logout
+
 ## Register
 ```powershell
 python secure_message_cli.py register alice
 ```
+Password must be 8-128 characters.
 
 ## Login
 ```powershell
