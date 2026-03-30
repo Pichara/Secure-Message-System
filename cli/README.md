@@ -14,6 +14,15 @@ If you already installed packages globally, re-run `pip install -r requirements.
 ```powershell
 python secure_message_cli.py config set-url http://localhost:8080
 ```
+Show config (masked by default):
+```powershell
+python secure_message_cli.py config show
+python secure_message_cli.py config show --full
+```
+Disable local history storage:
+```powershell
+python secure_message_cli.py config set-history off
+```
 
 ## Launcher (default)
 ```powershell
@@ -44,6 +53,10 @@ Menu options (requires login):
 ## Send message
 ```powershell
 python secure_message_cli.py send bob "hello from cli"
+```
+Send without saving plaintext locally:
+```powershell
+python secure_message_cli.py send bob "hello" --no-history
 ```
 
 ## Read messages

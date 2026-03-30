@@ -38,6 +38,15 @@ Academic secure messaging project with **end-to-end encryption (E2EE)** and expl
 ## API Notes
 - CORS defaults to `*` and can be overridden with `CORS_ORIGIN`.
 - Responses are JSON; errors use `{"error":"..."}`.
+- `order` and `before_id` operate on message IDs for stable pagination.
+
+## Security Controls (Additional)
+- Input validation with bounded username/password lengths and allowed characters.
+- Request body size limits to reduce abuse.
+- Basic in-memory rate limiting on login/register (per IP and username).
+- Token cleanup for expired bearer tokens.
+- Optional HSTS via `HSTS_ENABLED=true` when serving over HTTPS.
+- CLI config masks sensitive values by default; local history can be disabled.
 
 ## Stack (Reference)
 - Backend: C++ (cpp‑httplib, nlohmann/json, libpqxx, libsodium)

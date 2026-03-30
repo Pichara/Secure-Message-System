@@ -1,4 +1,5 @@
 import base64
+import copy
 import inspect
 import json
 import os
@@ -61,13 +62,21 @@ def _b64decode(data: str) -> bytes:
 
 def _state() -> dict:
     if not STATE_FILE.exists():
-        return {"backend_url": DEFAULT_BACKEND_URL, "auth": {}, "keys": {}}
+        return {
+            "backend_url": DEFAULT_BACKEND_URL,
+            "auth": {},
+            "keys": {},
+            "contacts": {},
+            "save_history": True,
+        }
     return json.loads(STATE_FILE.read_text(encoding="utf-8"))
 
 
 def _save_state(state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    if os.name != "nt":
+        STATE_FILE.chmod(0o600)
 
 
 def _backend_url(state: dict) -> str:
@@ -81,6 +90,27 @@ def _contacts(state: dict) -> dict:
 def _resolve_alias(state: dict, name: str) -> str:
     contacts = _contacts(state)
     return contacts.get(name, name)
+
+
+def _mask_secret(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "***"
+    return f"{value[:4]}...{value[-4:]}"
+
+
+def _masked_state(state: dict) -> dict:
+    masked = copy.deepcopy(state)
+    auth = masked.get("auth") or {}
+    if auth.get("token"):
+        auth["token"] = _mask_secret(auth["token"])
+    masked["auth"] = auth
+    keys = masked.get("keys") or {}
+    if keys.get("encrypted_private_key"):
+        keys["encrypted_private_key"] = _mask_secret(keys["encrypted_private_key"])
+    masked["keys"] = keys
+    return masked
 
 
 def _require_auth(state: dict) -> dict:
@@ -481,9 +511,28 @@ def config_set_url(url: str):
 
 
 @config_app.command("show")
-def config_show():
+def config_show(full: bool = typer.Option(False, "--full")):
     state = _state()
+    if not full:
+        state = _masked_state(state)
     typer.echo(json.dumps(state, indent=2))
+
+
+@config_app.command("set-history")
+def config_set_history(value: str):
+    normalized = value.strip().lower()
+    if normalized in {"on", "true", "1", "yes"}:
+        enabled = True
+    elif normalized in {"off", "false", "0", "no"}:
+        enabled = False
+    else:
+        typer.secho("Value must be on/off or true/false.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    state = _state()
+    state["save_history"] = enabled
+    _save_state(state)
+    status = "on" if enabled else "off"
+    typer.echo(f"History saving set to {status}.")
 
 
 @contacts_app.command("add")
@@ -709,7 +758,7 @@ def logout():
 
 
 @app.command()
-def send(recipient: str, message: str):
+def send(recipient: str, message: str, no_history: bool = typer.Option(False, "--no-history")):
     state = _state()
     auth = _require_auth(state)
     recipient = _resolve_alias(state, recipient)
@@ -744,13 +793,17 @@ def send(recipient: str, message: str):
         raise typer.Exit(1)
 
     msg_id = post_resp.json().get("id")
-    _append_history({
-        "id": msg_id,
-        "sender": auth["username"],
-        "recipient": recipient,
-        "plaintext": message,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
+    save_history = state.get("save_history", True) and not no_history
+    _append_history(
+        {
+            "id": msg_id,
+            "sender": auth["username"],
+            "recipient": recipient,
+            "plaintext": message,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+        save_history=save_history,
+    )
 
     typer.echo(f"Message sent (id={msg_id}).")
 
@@ -872,10 +925,14 @@ def chat(with_user: str):
     _chat_flow(state, auth, with_user, private_key)
 
 
-def _append_history(entry: dict) -> None:
+def _append_history(entry: dict, save_history: bool = True) -> None:
+    if not save_history:
+        return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with HISTORY_FILE.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry) + "\n")
+    if os.name != "nt":
+        HISTORY_FILE.chmod(0o600)
 
 
 def _load_history() -> dict:

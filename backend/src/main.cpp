@@ -5,16 +5,19 @@
 
 #include <array>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <iomanip>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using json = nlohmann::json;
@@ -30,6 +33,46 @@ struct DbUser {
   std::string password_hash;
   std::string public_key;
   std::string encrypted_private_key;
+};
+
+constexpr size_t kMaxBodyBytes = 256 * 1024;
+constexpr size_t kMinUsernameLen = 3;
+constexpr size_t kMaxUsernameLen = 32;
+constexpr size_t kMinPasswordLen = 8;
+constexpr size_t kMaxPasswordLen = 128;
+constexpr size_t kMaxPublicKeyLen = 512;
+constexpr size_t kMaxEncryptedPrivateKeyLen = 8192;
+constexpr size_t kMaxEncryptedKeyLen = 4096;
+constexpr size_t kMaxCiphertextLen = 16384;
+constexpr size_t kMaxIvLen = 128;
+
+struct RateLimitEntry {
+  int count = 0;
+  std::chrono::system_clock::time_point window_start{};
+};
+
+struct RateLimiter {
+  bool Allow(const std::string& key,
+             int limit,
+             std::chrono::seconds window,
+             std::chrono::system_clock::time_point now) {
+    std::lock_guard<std::mutex> lock(mu);
+    auto& entry = entries[key];
+    if (entry.count == 0 || now - entry.window_start > window) {
+      entry.count = 0;
+      entry.window_start = now;
+    }
+    entry.count += 1;
+    return entry.count <= limit;
+  }
+
+  std::mutex mu;
+  std::unordered_map<std::string, RateLimitEntry> entries;
+};
+
+struct CorsConfig {
+  bool allow_all = true;
+  std::unordered_set<std::string> allowed;
 };
 
 std::string NowIso8601Utc() {
@@ -53,6 +96,42 @@ std::string GetEnvOrDefault(const char* key, const char* fallback) {
     return std::string(value);
   }
   return std::string(fallback);
+}
+
+std::string Trim(const std::string& input) {
+  size_t start = 0;
+  while (start < input.size() &&
+         std::isspace(static_cast<unsigned char>(input[start]))) {
+    start++;
+  }
+  size_t end = input.size();
+  while (end > start &&
+         std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+    end--;
+  }
+  return input.substr(start, end - start);
+}
+
+std::unordered_set<std::string> SplitCsvToSet(const std::string& csv) {
+  std::unordered_set<std::string> result;
+  std::stringstream ss(csv);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    auto trimmed = Trim(item);
+    if (!trimmed.empty()) {
+      result.insert(trimmed);
+    }
+  }
+  return result;
+}
+
+bool IsTruthy(const std::string& value) {
+  std::string v;
+  v.reserve(value.size());
+  for (char ch : value) {
+    v.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+  }
+  return v == "1" || v == "true" || v == "yes";
 }
 
 std::string GetDbUrl() {
@@ -83,7 +162,8 @@ std::optional<std::string> ExtractBearerToken(const httplib::Request& req) {
 
 std::optional<std::string> ValidateToken(const httplib::Request& req,
                                          std::unordered_map<std::string, TokenInfo>& tokens,
-                                         std::mutex& token_mu) {
+                                         std::mutex& token_mu,
+                                         std::chrono::system_clock::time_point& last_cleanup) {
   auto token_opt = ExtractBearerToken(req);
   if (!token_opt.has_value()) {
     return std::nullopt;
@@ -92,6 +172,16 @@ std::optional<std::string> ValidateToken(const httplib::Request& req,
   auto now = std::chrono::system_clock::now();
 
   std::lock_guard<std::mutex> lock(token_mu);
+  if (now - last_cleanup > std::chrono::minutes(5)) {
+    for (auto it = tokens.begin(); it != tokens.end();) {
+      if (it->second.expires_at < now) {
+        it = tokens.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    last_cleanup = now;
+  }
   auto it = tokens.find(token);
   if (it == tokens.end()) {
     return std::nullopt;
@@ -101,6 +191,57 @@ std::optional<std::string> ValidateToken(const httplib::Request& req,
     return std::nullopt;
   }
   return it->second.username;
+}
+
+bool IsValidUsername(const std::string& username) {
+  if (username.size() < kMinUsernameLen || username.size() > kMaxUsernameLen) {
+    return false;
+  }
+  for (char ch : username) {
+    if (std::isalnum(static_cast<unsigned char>(ch))) {
+      continue;
+    }
+    if (ch == '_' || ch == '-' || ch == '.') {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+bool IsValidPassword(const std::string& password) {
+  return password.size() >= kMinPasswordLen && password.size() <= kMaxPasswordLen;
+}
+
+bool IsFieldLengthValid(const std::string& value, size_t max_len) {
+  return value.size() <= max_len;
+}
+
+bool CheckBodySize(const httplib::Request& req, httplib::Response& res) {
+  if (req.body.size() > kMaxBodyBytes) {
+    res.status = 413;
+    res.set_content("{\"error\":\"payload_too_large\"}", "application/json");
+    return false;
+  }
+  return true;
+}
+
+bool ApplyCors(const httplib::Request& req, httplib::Response& res, const CorsConfig& cors) {
+  const std::string origin = req.get_header_value("Origin");
+  if (!origin.empty()) {
+    if (cors.allow_all) {
+      res.set_header("Access-Control-Allow-Origin", "*");
+    } else if (cors.allowed.count(origin)) {
+      res.set_header("Access-Control-Allow-Origin", origin);
+      res.set_header("Vary", "Origin");
+    } else {
+      return false;
+    }
+  }
+  res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.set_header("Access-Control-Max-Age", "86400");
+  return true;
 }
 
 void EnsureSchema(pqxx::connection& conn) {
@@ -167,27 +308,66 @@ int main() {
 
   std::mutex token_mu;
   std::unordered_map<std::string, TokenInfo> tokens;
+  std::chrono::system_clock::time_point last_token_cleanup = std::chrono::system_clock::now();
 
+  RateLimiter login_ip_limiter;
+  RateLimiter login_user_limiter;
+  RateLimiter register_ip_limiter;
+  RateLimiter register_user_limiter;
+
+  CorsConfig cors;
   std::string cors_origin = GetEnvOrDefault("CORS_ORIGIN", "*");
-  server.set_default_headers({
-      {"Access-Control-Allow-Origin", cors_origin},
-      {"Access-Control-Allow-Headers", "Content-Type, Authorization"},
-      {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
-      {"Access-Control-Max-Age", "86400"},
+  if (cors_origin != "*") {
+    cors.allow_all = false;
+    cors.allowed = SplitCsvToSet(cors_origin);
+  }
+
+  bool hsts_enabled = IsTruthy(GetEnvOrDefault("HSTS_ENABLED", ""));
+  httplib::Headers default_headers = {
       {"Cache-Control", "no-store"},
       {"X-Content-Type-Options", "nosniff"},
-  });
+  };
+  if (hsts_enabled) {
+    default_headers.emplace("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
+  server.set_default_headers(default_headers);
 
-  server.Options(R"(/api/.*)", [](const httplib::Request&, httplib::Response& res) {
+  server.Options(R"(/api/.*)", [&](const httplib::Request& req, httplib::Response& res) {
+    if (!ApplyCors(req, res, cors)) {
+      res.status = 403;
+      res.set_content("{\"error\":\"cors_denied\"}", "application/json");
+      return;
+    }
     res.status = 204;
   });
 
-  server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+  server.Get("/health", [&](const httplib::Request& req, httplib::Response& res) {
+    if (!ApplyCors(req, res, cors)) {
+      res.status = 403;
+      res.set_content("{\"error\":\"cors_denied\"}", "application/json");
+      return;
+    }
     json out = { {"status", "ok"} };
     res.set_content(out.dump(), "application/json");
   });
 
   server.Post("/api/register", [&](const httplib::Request& req, httplib::Response& res) {
+    if (!ApplyCors(req, res, cors)) {
+      res.status = 403;
+      res.set_content("{\"error\":\"cors_denied\"}", "application/json");
+      return;
+    }
+    if (!CheckBodySize(req, res)) {
+      return;
+    }
+
+    auto now = std::chrono::system_clock::now();
+    if (!register_ip_limiter.Allow(req.remote_addr, 10, std::chrono::seconds(60), now)) {
+      res.status = 429;
+      res.set_content("{\"error\":\"rate_limited\"}", "application/json");
+      return;
+    }
+
     json body;
     try {
       body = json::parse(req.body);
@@ -205,6 +385,28 @@ int main() {
     if (username.empty() || password.empty() || public_key.empty() || encrypted_private_key.empty()) {
       res.status = 400;
       res.set_content("{\"error\":\"missing_fields\"}", "application/json");
+      return;
+    }
+    if (!IsValidUsername(username)) {
+      res.status = 400;
+      res.set_content("{\"error\":\"invalid_username\"}", "application/json");
+      return;
+    }
+    if (!IsValidPassword(password)) {
+      res.status = 400;
+      res.set_content("{\"error\":\"invalid_password\"}", "application/json");
+      return;
+    }
+    if (!IsFieldLengthValid(public_key, kMaxPublicKeyLen) ||
+        !IsFieldLengthValid(encrypted_private_key, kMaxEncryptedPrivateKeyLen)) {
+      res.status = 400;
+      res.set_content("{\"error\":\"invalid_fields\"}", "application/json");
+      return;
+    }
+
+    if (!register_user_limiter.Allow(username, 5, std::chrono::seconds(60), now)) {
+      res.status = 429;
+      res.set_content("{\"error\":\"rate_limited\"}", "application/json");
       return;
     }
 
@@ -248,6 +450,22 @@ int main() {
   });
 
   server.Post("/api/login", [&](const httplib::Request& req, httplib::Response& res) {
+    if (!ApplyCors(req, res, cors)) {
+      res.status = 403;
+      res.set_content("{\"error\":\"cors_denied\"}", "application/json");
+      return;
+    }
+    if (!CheckBodySize(req, res)) {
+      return;
+    }
+
+    auto now = std::chrono::system_clock::now();
+    if (!login_ip_limiter.Allow(req.remote_addr, 20, std::chrono::seconds(60), now)) {
+      res.status = 429;
+      res.set_content("{\"error\":\"rate_limited\"}", "application/json");
+      return;
+    }
+
     json body;
     try {
       body = json::parse(req.body);
@@ -263,6 +481,22 @@ int main() {
     if (username.empty() || password.empty()) {
       res.status = 400;
       res.set_content("{\"error\":\"missing_fields\"}", "application/json");
+      return;
+    }
+    if (!IsValidUsername(username)) {
+      res.status = 400;
+      res.set_content("{\"error\":\"invalid_username\"}", "application/json");
+      return;
+    }
+    if (!IsValidPassword(password)) {
+      res.status = 400;
+      res.set_content("{\"error\":\"invalid_password\"}", "application/json");
+      return;
+    }
+
+    if (!login_user_limiter.Allow(username, 10, std::chrono::seconds(60), now)) {
+      res.status = 429;
+      res.set_content("{\"error\":\"rate_limited\"}", "application/json");
       return;
     }
 
@@ -298,6 +532,11 @@ int main() {
   });
 
   server.Post("/api/logout", [&](const httplib::Request& req, httplib::Response& res) {
+    if (!ApplyCors(req, res, cors)) {
+      res.status = 403;
+      res.set_content("{\"error\":\"cors_denied\"}", "application/json");
+      return;
+    }
     auto token_opt = ExtractBearerToken(req);
     if (!token_opt.has_value()) {
       res.status = 401;
@@ -307,6 +546,16 @@ int main() {
 
     auto now = std::chrono::system_clock::now();
     std::lock_guard<std::mutex> lock(token_mu);
+    if (now - last_token_cleanup > std::chrono::minutes(5)) {
+      for (auto it = tokens.begin(); it != tokens.end();) {
+        if (it->second.expires_at < now) {
+          it = tokens.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      last_token_cleanup = now;
+    }
     auto it = tokens.find(*token_opt);
     if (it == tokens.end() || it->second.expires_at < now) {
       if (it != tokens.end()) {
@@ -321,7 +570,12 @@ int main() {
   });
 
   server.Get("/api/me", [&](const httplib::Request& req, httplib::Response& res) {
-    auto auth_user = ValidateToken(req, tokens, token_mu);
+    if (!ApplyCors(req, res, cors)) {
+      res.status = 403;
+      res.set_content("{\"error\":\"cors_denied\"}", "application/json");
+      return;
+    }
+    auto auth_user = ValidateToken(req, tokens, token_mu, last_token_cleanup);
     if (!auth_user.has_value()) {
       res.status = 401;
       res.set_content("{\"error\":\"unauthorized\"}", "application/json");
@@ -351,7 +605,12 @@ int main() {
   });
 
   server.Get(R"(/api/users/(.*)/public-key)", [&](const httplib::Request& req, httplib::Response& res) {
-    auto auth_user = ValidateToken(req, tokens, token_mu);
+    if (!ApplyCors(req, res, cors)) {
+      res.status = 403;
+      res.set_content("{\"error\":\"cors_denied\"}", "application/json");
+      return;
+    }
+    auto auth_user = ValidateToken(req, tokens, token_mu, last_token_cleanup);
     if (!auth_user.has_value()) {
       res.status = 401;
       res.set_content("{\"error\":\"unauthorized\"}", "application/json");
@@ -359,6 +618,11 @@ int main() {
     }
 
     std::string username = req.matches[1];
+    if (!IsValidUsername(username)) {
+      res.status = 400;
+      res.set_content("{\"error\":\"invalid_username\"}", "application/json");
+      return;
+    }
     try {
       pqxx::connection conn(GetDbUrl());
       auto user = GetUserByUsername(conn, username);
@@ -378,7 +642,15 @@ int main() {
   });
 
   server.Post("/api/messages", [&](const httplib::Request& req, httplib::Response& res) {
-    auto auth_user = ValidateToken(req, tokens, token_mu);
+    if (!ApplyCors(req, res, cors)) {
+      res.status = 403;
+      res.set_content("{\"error\":\"cors_denied\"}", "application/json");
+      return;
+    }
+    if (!CheckBodySize(req, res)) {
+      return;
+    }
+    auto auth_user = ValidateToken(req, tokens, token_mu, last_token_cleanup);
     if (!auth_user.has_value()) {
       res.status = 401;
       res.set_content("{\"error\":\"unauthorized\"}", "application/json");
@@ -402,6 +674,18 @@ int main() {
     if (recipient.empty() || encrypted_key.empty() || ciphertext.empty() || iv.empty()) {
       res.status = 400;
       res.set_content("{\"error\":\"missing_fields\"}", "application/json");
+      return;
+    }
+    if (!IsValidUsername(recipient)) {
+      res.status = 400;
+      res.set_content("{\"error\":\"invalid_username\"}", "application/json");
+      return;
+    }
+    if (!IsFieldLengthValid(encrypted_key, kMaxEncryptedKeyLen) ||
+        !IsFieldLengthValid(ciphertext, kMaxCiphertextLen) ||
+        !IsFieldLengthValid(iv, kMaxIvLen)) {
+      res.status = 400;
+      res.set_content("{\"error\":\"invalid_fields\"}", "application/json");
       return;
     }
 
@@ -436,7 +720,12 @@ int main() {
   });
 
   server.Get("/api/messages", [&](const httplib::Request& req, httplib::Response& res) {
-    auto auth_user = ValidateToken(req, tokens, token_mu);
+    if (!ApplyCors(req, res, cors)) {
+      res.status = 403;
+      res.set_content("{\"error\":\"cors_denied\"}", "application/json");
+      return;
+    }
+    auto auth_user = ValidateToken(req, tokens, token_mu, last_token_cleanup);
     if (!auth_user.has_value()) {
       res.status = 401;
       res.set_content("{\"error\":\"unauthorized\"}", "application/json");
@@ -505,7 +794,7 @@ int main() {
               "JOIN users ru ON m.recipient_id = ru.id "
               "WHERE ((m.sender_id = $1 AND m.recipient_id = $2) OR (m.sender_id = $2 AND m.recipient_id = $1)) "
               "AND m.id < $3 "
-              "ORDER BY m.created_at " + order_sql + ", m.id " + order_sql + " "
+              "ORDER BY m.id " + order_sql + " "
               "LIMIT $4",
               me->id,
               *with_id,
@@ -518,7 +807,7 @@ int main() {
               "JOIN users su ON m.sender_id = su.id "
               "JOIN users ru ON m.recipient_id = ru.id "
               "WHERE (m.sender_id = $1 AND m.recipient_id = $2) OR (m.sender_id = $2 AND m.recipient_id = $1) "
-              "ORDER BY m.created_at " + order_sql + ", m.id " + order_sql + " "
+              "ORDER BY m.id " + order_sql + " "
               "LIMIT $3",
               me->id,
               *with_id,
@@ -533,7 +822,7 @@ int main() {
               "JOIN users ru ON m.recipient_id = ru.id "
               "WHERE (m.sender_id = $1 OR m.recipient_id = $1) "
               "AND m.id < $2 "
-              "ORDER BY m.created_at " + order_sql + ", m.id " + order_sql + " "
+              "ORDER BY m.id " + order_sql + " "
               "LIMIT $3",
               me->id,
               *before_id,
@@ -545,7 +834,7 @@ int main() {
               "JOIN users su ON m.sender_id = su.id "
               "JOIN users ru ON m.recipient_id = ru.id "
               "WHERE m.sender_id = $1 OR m.recipient_id = $1 "
-              "ORDER BY m.created_at " + order_sql + ", m.id " + order_sql + " "
+              "ORDER BY m.id " + order_sql + " "
               "LIMIT $2",
               me->id,
               limit);
