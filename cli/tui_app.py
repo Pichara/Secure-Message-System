@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from textual.app import App, ComposeResult
+from textual import work
 from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, Footer, Header, Input, ListItem, ListView, RichLog, Static
@@ -245,9 +246,6 @@ class MessageScreen(Screen):
         with Horizontal(id="main"):
             with Container(id="sidebar"):
                 yield Static("Contacts", id="sidebar-title")
-                with Horizontal(id="contact-actions"):
-                    yield Button("New Chat", id="new-chat", variant="primary")
-                    yield Button("Refresh", id="refresh")
                 yield ListView(id="contact-list")
                 yield Static("No contact selected.", id="details")
             with Vertical(id="messages"):
@@ -385,13 +383,6 @@ class MessageScreen(Screen):
         self.current_with = user
         self._render_conversation(user)
 
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "new-chat":
-            await self.action_new_chat()
-            return
-        if event.button.id == "refresh":
-            self.action_refresh()
-
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "compose":
             return
@@ -453,6 +444,7 @@ class MessageScreen(Screen):
             self.action_refresh()
             return
 
+    @work(exclusive=True)
     async def action_new_chat(self) -> None:
         while True:
             username = await self.app.push_screen(InputDialog("Start chat with:", "username"), wait_for_dismiss=True)
@@ -503,8 +495,12 @@ class MessageScreen(Screen):
         if self.current_with:
             self._render_conversation(self.current_with)
 
+    @work(exclusive=True)
     async def action_unlock(self) -> None:
-        password = await self.app.push_screen(InputDialog("Unlock inbox", "password", password=True), wait_for_dismiss=True)
+        password = await self.app.push_screen(
+            InputDialog("Unlock inbox", "password", password=True),
+            wait_for_dismiss=True,
+        )
         if not password:
             return
         state = _state()
