@@ -35,6 +35,8 @@ TUI hotkeys:
 - `u` unlock inbox (decrypt)
 - `l` logout
 
+![Secure Message CLI](CLI.png)
+
 ## API (Current)
 1. `GET /health`
 2. `GET /openapi.json`

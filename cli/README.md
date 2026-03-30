@@ -46,6 +46,8 @@ TUI hotkeys:
 - `u` unlock inbox (decrypt received messages)
 - `l` logout
 
+![Secure Message CLI](../CLI.png)
+
 ## Register
 ```powershell
 python secure_message_cli.py register alice
