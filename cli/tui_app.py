@@ -58,6 +58,10 @@ class InputDialog(ModalScreen[str]):
         else:
             self.dismiss("")
 
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        value = event.value.strip()
+        self.dismiss(value)
+
 
 class AuthScreen(Screen):
     CSS = """
@@ -417,36 +421,45 @@ class MessageScreen(Screen):
         self._render_conversation(self.current_with)
 
     async def action_new_chat(self) -> None:
-        username = await self.app.push_screen(InputDialog("Start chat with:", "username"))
-        if not username:
-            return
-        state = _state()
-        username = _resolve_alias(state, username)
-        auth = state.get("auth") or {}
-        resp = _request(
-            "GET",
-            f"{_backend_url(state)}/api/users/{username}/public-key",
-            token=auth.get("token"),
-        )
-        if resp.status_code != 200:
-            if resp.status_code == 404:
-                self._set_status("User not found.")
-            else:
+        while True:
+            username = await self.app.push_screen(InputDialog("Start chat with:", "username"))
+            if not username:
+                return
+            state = _state()
+            username = _resolve_alias(state, username)
+            auth = state.get("auth") or {}
+            resp = _request(
+                "GET",
+                f"{_backend_url(state)}/api/users/{username}/public-key",
+                token=auth.get("token"),
+            )
+            if resp.status_code != 200:
+                if resp.status_code == 404:
+                    self._set_status("User not found.")
+                    continue
                 self._set_status(f"Failed to resolve user: {resp.text}")
+                return
+
+            contacts = state.get("contacts") or {}
+            if username not in contacts.values() and username not in contacts.keys():
+                contacts[username] = username
+                state["contacts"] = contacts
+                _save_state(state)
+                self._set_status(f"Added {username} to contacts.")
+            else:
+                self._set_status(f"{username} is already in contacts.")
+            self._refresh_contacts()
+
+            list_view = self.query_one("#contact-list", ListView)
+            for index, item in enumerate(list_view.children):
+                if getattr(item, "user", None) == username:
+                    list_view.index = index
+                    list_view.scroll_to_item(item)
+                    break
+
+            self.current_with = username
+            self._render_conversation(username)
             return
-
-        contacts = state.get("contacts") or {}
-        if username not in contacts.values() and username not in contacts.keys():
-            contacts[username] = username
-            state["contacts"] = contacts
-            _save_state(state)
-            self._set_status(f"Added {username} to contacts.")
-        else:
-            self._set_status(f"{username} is already in contacts.")
-        self._refresh_contacts()
-
-        self.current_with = username
-        self._render_conversation(username)
 
     def action_refresh(self) -> None:
         self._refresh_contacts()
