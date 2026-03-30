@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from textual.app import App, ComposeResult
@@ -114,6 +115,8 @@ class AuthScreen(Screen):
 
         data = resp.json()
         token = data["token"]
+        expires_in = int(data.get("expires_in", 3600))
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
         me_url = f"{_backend_url(state)}/api/me"
         me_resp = _request("GET", me_url, token=token)
         if me_resp.status_code != 200:
@@ -121,7 +124,11 @@ class AuthScreen(Screen):
             return None
 
         me = me_resp.json()
-        state["auth"] = {"token": token, "username": username, "expires_at": None}
+        state["auth"] = {
+            "token": token,
+            "username": username,
+            "expires_at": expires_at.isoformat(),
+        }
         state["keys"] = {
             "public_key": me["public_key"],
             "encrypted_private_key": me["encrypted_private_key"],
@@ -207,6 +214,10 @@ class MessageScreen(Screen):
         border-top: solid #4c4c4c;
         padding: 1 1;
     }
+    #contact-actions {
+        height: 3;
+        margin-bottom: 1;
+    }
     #messages {
         width: 70%;
         border: round #4c4c4c;
@@ -234,6 +245,9 @@ class MessageScreen(Screen):
         with Horizontal(id="main"):
             with Container(id="sidebar"):
                 yield Static("Contacts", id="sidebar-title")
+                with Horizontal(id="contact-actions"):
+                    yield Button("New Chat", id="new-chat", variant="primary")
+                    yield Button("Refresh", id="refresh")
                 yield ListView(id="contact-list")
                 yield Static("No contact selected.", id="details")
             with Vertical(id="messages"):
@@ -281,6 +295,10 @@ class MessageScreen(Screen):
             token=auth.get("token"),
         )
         if resp.status_code != 200:
+            if resp.status_code == 401:
+                self._set_status("Session expired. Please login again.")
+                self.app.push_screen(AuthScreen())
+                return
             if resp.status_code == 404:
                 self._set_status("User not found.")
             else:
@@ -367,6 +385,13 @@ class MessageScreen(Screen):
         self.current_with = user
         self._render_conversation(user)
 
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "new-chat":
+            await self.action_new_chat()
+            return
+        if event.button.id == "refresh":
+            self.action_refresh()
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "compose":
             return
@@ -434,6 +459,10 @@ class MessageScreen(Screen):
                 token=auth.get("token"),
             )
             if resp.status_code != 200:
+                if resp.status_code == 401:
+                    self._set_status("Session expired. Please login again.")
+                    self.app.push_screen(AuthScreen())
+                    return
                 if resp.status_code == 404:
                     self._set_status("User not found.")
                     continue
