@@ -447,7 +447,7 @@ class MessageScreen(Screen):
 
     async def action_new_chat(self) -> None:
         while True:
-            username = await self.app.push_screen(InputDialog("Start chat with:", "username"))
+            username = await self.app.push_screen(InputDialog("Start chat with:", "username"), wait_for_dismiss=True)
             if not username:
                 return
             state = _state()
@@ -496,7 +496,7 @@ class MessageScreen(Screen):
             self._render_conversation(self.current_with)
 
     async def action_unlock(self) -> None:
-        password = await self.app.push_screen(InputDialog("Unlock inbox", "password", password=True))
+        password = await self.app.push_screen(InputDialog("Unlock inbox", "password", password=True), wait_for_dismiss=True)
         if not password:
             return
         state = _state()
