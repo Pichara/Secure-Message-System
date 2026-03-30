@@ -656,7 +656,18 @@ def register(username: str):
     url = f"{_backend_url(state)}/api/register"
     resp = _request("POST", url, json=payload)
     if resp.status_code != 201:
-        typer.secho(f"Register failed: {resp.text}", fg=typer.colors.RED)
+        message = resp.text
+        try:
+            payload = resp.json()
+            if payload.get("error") == "invalid_password":
+                message = payload.get("message") or "Password must be 8-128 characters."
+            elif payload.get("error") == "registration_failed":
+                message = "Registration failed."
+            else:
+                message = resp.text
+        except Exception:
+            pass
+        typer.secho(f"Register failed: {message}", fg=typer.colors.RED)
         raise typer.Exit(1)
 
     state["keys"] = {

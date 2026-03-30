@@ -46,6 +46,7 @@ Academic secure messaging project with **end-to-end encryption (E2EE)** and expl
 
 ## Security Controls (Additional)
 - Input validation with bounded username/password lengths and allowed characters.
+- Passwords must be 8-128 characters.
 - Request body size limits to reduce abuse.
 - Basic in-memory rate limiting on login/register (per IP and username).
 - Token cleanup for expired bearer tokens.

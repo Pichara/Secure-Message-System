@@ -12,7 +12,6 @@ from secure_message_cli import (
     _append_history,
     _auth_valid,
     _backend_url,
-    _conversation_list,
     _decrypt_message,
     _encrypt_message,
     _encrypt_private_key,
@@ -141,7 +140,16 @@ class AuthScreen(Screen):
         url = f"{_backend_url(state)}/api/register"
         resp = _request("POST", url, json=payload)
         if resp.status_code != 201:
-            self._set_status(f"Register failed: {resp.text}")
+            message = resp.text
+            try:
+                data = resp.json()
+                if data.get("error") == "invalid_password":
+                    message = data.get("message") or "Password must be 8-128 characters."
+                elif data.get("error") == "registration_failed":
+                    message = "Registration failed."
+            except Exception:
+                pass
+            self._set_status(f"Register failed: {message}")
             return False
         state["keys"] = {
             "public_key": payload["public_key"],
@@ -190,6 +198,11 @@ class MessageScreen(Screen):
         min-width: 24;
         border: round #4c4c4c;
     }
+    #details {
+        height: 8;
+        border-top: solid #4c4c4c;
+        padding: 1 1;
+    }
     #messages {
         width: 70%;
         border: round #4c4c4c;
@@ -216,8 +229,9 @@ class MessageScreen(Screen):
         yield Header()
         with Horizontal(id="main"):
             with Container(id="sidebar"):
-                yield Static("Conversations", id="sidebar-title")
-                yield ListView(id="conversation-list")
+                yield Static("Contacts", id="sidebar-title")
+                yield ListView(id="contact-list")
+                yield Static("No contact selected.", id="details")
             with Vertical(id="messages"):
                 yield RichLog(id="message-log", wrap=True)
                 yield Input(placeholder="Type message and press Enter", id="compose")
@@ -226,36 +240,31 @@ class MessageScreen(Screen):
 
     def on_mount(self) -> None:
         self.query_one("#compose", Input).disabled = True
-        self._refresh_conversations()
+        self._refresh_contacts()
 
     def _set_status(self, message: str) -> None:
         self.query_one("#status", Static).update(message)
 
-    def _refresh_conversations(self) -> None:
+    def _refresh_contacts(self) -> None:
         state = _state()
         auth = state.get("auth") or {}
         if not _auth_valid(auth):
             self.app.push_screen(AuthScreen())
             return
 
-        resp = _request("GET", f"{_backend_url(state)}/api/messages", token=auth["token"])
-        if resp.status_code != 200:
-            self._set_status(f"Failed to fetch conversations: {resp.text}")
-            return
-
-        messages = resp.json()
-        conversations = _conversation_list(messages, auth["username"])
-        list_view = self.query_one("#conversation-list", ListView)
+        contacts = state.get("contacts") or {}
+        list_view = self.query_one("#contact-list", ListView)
         list_view.clear()
 
-        for user, latest in conversations:
-            label = f"{user} ({latest})" if latest else user
+        for alias, username in sorted(contacts.items()):
+            label = f"{alias} ({username})" if alias != username else username
             item = ListItem(Static(label))
-            item.user = user
+            item.user = username
+            item.alias = alias
             list_view.append(item)
 
-        if not conversations:
-            self._set_status("No conversations yet. Press 'n' to start one.")
+        if not contacts:
+            self._set_status("No contacts yet. Press 'n' to add one.")
 
     def _render_conversation(self, with_user: str) -> None:
         state = _state()
@@ -268,13 +277,19 @@ class MessageScreen(Screen):
             token=auth.get("token"),
         )
         if resp.status_code != 200:
-            self._set_status(f"Failed to load messages: {resp.text}")
+            if resp.status_code == 404:
+                self._set_status("User not found.")
+            else:
+                self._set_status(f"Failed to load messages: {resp.text}")
+            self.query_one("#compose", Input).disabled = True
             return
 
         messages = resp.json()
         messages.sort(key=lambda msg: msg.get("created_at", ""))
         log = self.query_one("#message-log", RichLog)
         log.clear()
+        if not messages:
+            log.write("No messages yet. Send one below.")
         for msg in messages:
             sender = msg.get("sender", "unknown")
             recipient = msg.get("recipient", "unknown")
@@ -298,9 +313,50 @@ class MessageScreen(Screen):
 
         self.query_one("#compose", Input).disabled = False
         self.query_one("#compose", Input).focus()
+        self._render_contact_details(with_user, messages)
         self._set_status(f"Chatting with {with_user}")
 
+    def _shorten(self, value: str, keep: int = 6) -> str:
+        if not value:
+            return "-"
+        if len(value) <= keep * 2:
+            return value
+        return f"{value[:keep]}...{value[-keep:]}"
+
+    def _render_contact_details(self, with_user: str, messages: list[dict]) -> None:
+        state = _state()
+        contacts = state.get("contacts") or {}
+        aliases = [alias for alias, username in contacts.items() if username == with_user]
+        alias_line = ", ".join(aliases) if aliases else "-"
+
+        last_msg = messages[-1] if messages else {}
+        last_time = last_msg.get("created_at", "-")
+        msg_count = str(len(messages))
+
+        public_key = "-"
+        resp = _request(
+            "GET",
+            f"{_backend_url(state)}/api/users/{with_user}/public-key",
+            token=(state.get("auth") or {}).get("token"),
+        )
+        if resp.status_code == 200:
+            public_key = self._shorten(resp.json().get("public_key", "-"))
+        elif resp.status_code == 404:
+            self.query_one("#details", Static).update("User not found.")
+            return
+
+        details = (
+            f"User: {with_user}\n"
+            f"Aliases: {alias_line}\n"
+            f"Messages: {msg_count}\n"
+            f"Last: {last_time}\n"
+            f"Public key: {public_key}"
+        )
+        self.query_one("#details", Static).update(details)
+
     def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id != "contact-list":
+            return
         user = getattr(event.item, "user", None)
         if not user:
             return
@@ -366,11 +422,34 @@ class MessageScreen(Screen):
             return
         state = _state()
         username = _resolve_alias(state, username)
+        auth = state.get("auth") or {}
+        resp = _request(
+            "GET",
+            f"{_backend_url(state)}/api/users/{username}/public-key",
+            token=auth.get("token"),
+        )
+        if resp.status_code != 200:
+            if resp.status_code == 404:
+                self._set_status("User not found.")
+            else:
+                self._set_status(f"Failed to resolve user: {resp.text}")
+            return
+
+        contacts = state.get("contacts") or {}
+        if username not in contacts.values() and username not in contacts.keys():
+            contacts[username] = username
+            state["contacts"] = contacts
+            _save_state(state)
+            self._set_status(f"Added {username} to contacts.")
+        else:
+            self._set_status(f"{username} is already in contacts.")
+        self._refresh_contacts()
+
         self.current_with = username
         self._render_conversation(username)
 
     def action_refresh(self) -> None:
-        self._refresh_conversations()
+        self._refresh_contacts()
         if self.current_with:
             self._render_conversation(self.current_with)
 

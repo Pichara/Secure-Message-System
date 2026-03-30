@@ -611,7 +611,7 @@ int main() {
     }
     if (!IsValidPassword(password)) {
       res.status = 400;
-      res.set_content("{\"error\":\"invalid_password\"}", "application/json");
+      res.set_content("{\"error\":\"invalid_password\",\"message\":\"password must be 8-128 characters\"}", "application/json");
       return;
     }
     if (!IsFieldLengthValid(public_key, kMaxPublicKeyLen) ||
@@ -643,8 +643,8 @@ int main() {
       pqxx::connection conn(GetDbUrl());
       auto existing = GetUserByUsername(conn, username);
       if (existing.has_value()) {
-        res.status = 409;
-        res.set_content("{\"error\":\"user_exists\"}", "application/json");
+        res.status = 400;
+        res.set_content("{\"error\":\"registration_failed\"}", "application/json");
         return;
       }
 
@@ -700,17 +700,6 @@ int main() {
       res.set_content("{\"error\":\"missing_fields\"}", "application/json");
       return;
     }
-    if (!IsValidUsername(username)) {
-      res.status = 400;
-      res.set_content("{\"error\":\"invalid_username\"}", "application/json");
-      return;
-    }
-    if (!IsValidPassword(password)) {
-      res.status = 400;
-      res.set_content("{\"error\":\"invalid_password\"}", "application/json");
-      return;
-    }
-
     if (!login_user_limiter.Allow(username, 10, std::chrono::seconds(60), now)) {
       res.status = 429;
       res.set_content("{\"error\":\"rate_limited\"}", "application/json");
