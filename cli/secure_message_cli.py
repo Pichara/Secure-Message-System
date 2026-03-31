@@ -52,14 +52,17 @@ if "ctx" in inspect.signature(click.Parameter.make_metavar).parameters:
     click.Parameter.make_metavar = _compat_make_metavar  # type: ignore[assignment]
 
 
+# Encode bytes as URL-safe base64 (ASCII string).
 def _b64encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii")
 
 
+# Decode URL-safe base64 strings back to bytes.
 def _b64decode(data: str) -> bytes:
     return base64.urlsafe_b64decode(data.encode("ascii"))
 
 
+# Load persisted CLI state (or defaults if missing).
 def _state() -> dict:
     if not STATE_FILE.exists():
         return {
@@ -72,6 +75,7 @@ def _state() -> dict:
     return json.loads(STATE_FILE.read_text(encoding="utf-8"))
 
 
+# Persist state to disk with best-effort permissions.
 def _save_state(state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -79,19 +83,23 @@ def _save_state(state: dict) -> None:
         STATE_FILE.chmod(0o600)
 
 
+# Resolve backend URL with fallback to default.
 def _backend_url(state: dict) -> str:
     return state.get("backend_url") or DEFAULT_BACKEND_URL
 
 
+# Convenience accessor for contact aliases.
 def _contacts(state: dict) -> dict:
     return state.get("contacts") or {}
 
 
+# Map an alias to its username, or return the input.
 def _resolve_alias(state: dict, name: str) -> str:
     contacts = _contacts(state)
     return contacts.get(name, name)
 
 
+# Mask secrets for display-only output.
 def _mask_secret(value: str) -> str:
     if not value:
         return ""
@@ -100,6 +108,7 @@ def _mask_secret(value: str) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
+# Return a copy of state with secrets redacted.
 def _masked_state(state: dict) -> dict:
     masked = copy.deepcopy(state)
     auth = masked.get("auth") or {}
@@ -113,6 +122,7 @@ def _masked_state(state: dict) -> dict:
     return masked
 
 
+# Ensure an auth token is present for protected actions.
 def _require_auth(state: dict) -> dict:
     auth = state.get("auth") or {}
     token = auth.get("token")
@@ -123,6 +133,7 @@ def _require_auth(state: dict) -> dict:
     return auth
 
 
+# Parse stored expiry timestamps, defaulting to UTC.
 def _parse_expires_at(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
@@ -135,6 +146,7 @@ def _parse_expires_at(value: Optional[str]) -> Optional[datetime]:
     return parsed
 
 
+# Validate cached auth data and TTL.
 def _auth_valid(auth: dict) -> bool:
     token = auth.get("token")
     username = auth.get("username")
@@ -146,6 +158,7 @@ def _auth_valid(auth: dict) -> bool:
     return True
 
 
+# Derive a symmetric key from password + salt using PBKDF2.
 def _derive_key(password: str, salt: bytes) -> bytes:
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
@@ -156,6 +169,7 @@ def _derive_key(password: str, salt: bytes) -> bytes:
     return kdf.derive(password.encode("utf-8"))
 
 
+# Encrypt private key bytes locally (AES-GCM; salt+nonce stored in payload).
 def _encrypt_private_key(private_bytes: bytes, password: str) -> str:
     salt = os.urandom(16)
     nonce = os.urandom(12)
@@ -170,6 +184,7 @@ def _encrypt_private_key(private_bytes: bytes, password: str) -> str:
     return json.dumps(payload)
 
 
+# Decrypt locally stored private key payload.
 def _decrypt_private_key(encrypted_payload: str, password: str) -> bytes:
     data = json.loads(encrypted_payload)
     salt = _b64decode(data["salt"])
@@ -180,12 +195,14 @@ def _decrypt_private_key(encrypted_payload: str, password: str) -> bytes:
     return aes.decrypt(nonce, ciphertext, None)
 
 
+# Generate an X25519 keypair for E2EE.
 def _generate_keypair():
     private_key = x25519.X25519PrivateKey.generate()
     public_key = private_key.public_key()
     return private_key, public_key
 
 
+# Serialize public key to URL-safe base64.
 def _serialize_public_key(public_key: x25519.X25519PublicKey) -> str:
     raw = public_key.public_bytes(
         encoding=serialization.Encoding.Raw,
@@ -194,6 +211,7 @@ def _serialize_public_key(public_key: x25519.X25519PublicKey) -> str:
     return _b64encode(raw)
 
 
+# Serialize private key to raw bytes (never stored unencrypted on disk).
 def _serialize_private_key(private_key: x25519.X25519PrivateKey) -> bytes:
     return private_key.private_bytes(
         encoding=serialization.Encoding.Raw,
@@ -202,6 +220,7 @@ def _serialize_private_key(private_key: x25519.X25519PrivateKey) -> bytes:
     )
 
 
+# Load + decrypt the private key from state using a user password.
 def _load_private_key_from_state(state: dict, password: str) -> x25519.X25519PrivateKey:
     encrypted_payload = state.get("keys", {}).get("encrypted_private_key")
     if not encrypted_payload:
@@ -211,11 +230,13 @@ def _load_private_key_from_state(state: dict, password: str) -> x25519.X25519Pri
     return x25519.X25519PrivateKey.from_private_bytes(private_bytes)
 
 
+# Encrypt a message using X25519 ECDH + HKDF + AES-GCM.
 def _encrypt_message(plaintext: str, recipient_public_b64: str) -> tuple[str, str, str]:
     recipient_public = x25519.X25519PublicKey.from_public_bytes(_b64decode(recipient_public_b64))
     eph_private = x25519.X25519PrivateKey.generate()
     eph_public = eph_private.public_key()
 
+    # Derive a fresh symmetric key per message using an ephemeral ECDH exchange.
     shared = eph_private.exchange(recipient_public)
     salt = os.urandom(16)
     hkdf = HKDF(
@@ -230,6 +251,7 @@ def _encrypt_message(plaintext: str, recipient_public_b64: str) -> tuple[str, st
     aes = AESGCM(key)
     ciphertext = aes.encrypt(iv, plaintext.encode("utf-8"), None)
 
+    # Payload contains ephemeral public key + salt (needed to derive the same AES key).
     encrypted_key = json.dumps({
         "epk": _b64encode(
             eph_public.public_bytes(
@@ -243,11 +265,13 @@ def _encrypt_message(plaintext: str, recipient_public_b64: str) -> tuple[str, st
     return encrypted_key, _b64encode(ciphertext), _b64encode(iv)
 
 
+# Decrypt a message given the encrypted key payload and recipient private key.
 def _decrypt_message(ciphertext_b64: str, iv_b64: str, encrypted_key_payload: str, private_key: x25519.X25519PrivateKey) -> str:
     data = json.loads(encrypted_key_payload)
     eph_public = x25519.X25519PublicKey.from_public_bytes(_b64decode(data["epk"]))
     salt = _b64decode(data["salt"])
 
+    # Recreate the same derived key from the sender's ephemeral public key.
     shared = private_key.exchange(eph_public)
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
@@ -261,6 +285,7 @@ def _decrypt_message(ciphertext_b64: str, iv_b64: str, encrypted_key_payload: st
     return plaintext.decode("utf-8")
 
 
+# Wrapper for backend HTTP requests with consistent headers/timeouts.
 def _request(method: str, url: str, token: Optional[str] = None, **kwargs):
     headers = kwargs.pop("headers", {})
     headers["Content-Type"] = "application/json"
@@ -269,6 +294,7 @@ def _request(method: str, url: str, token: Optional[str] = None, **kwargs):
     return requests.request(method, url, headers=headers, timeout=15, **kwargs)
 
 
+# Prompt for a single-character choice using prompt_toolkit if available.
 def _prompt_choice(prompt: str, valid: set[str], default: Optional[str] = None) -> str:
     try:
         return _prompt_choice_ptk(prompt, valid, default)
@@ -276,6 +302,7 @@ def _prompt_choice(prompt: str, valid: set[str], default: Optional[str] = None) 
         return _prompt_choice_typer(prompt, valid, default)
 
 
+# Fallback prompt using Typer for choice inputs.
 def _prompt_choice_typer(prompt: str, valid: set[str], default: Optional[str]) -> str:
     while True:
         choice = typer.prompt(prompt, default=default) if default is not None else typer.prompt(prompt)
@@ -285,6 +312,7 @@ def _prompt_choice_typer(prompt: str, valid: set[str], default: Optional[str]) -
         typer.secho(f"Invalid choice: {choice}", fg=typer.colors.RED)
 
 
+# Fast single-key choice prompt using prompt_toolkit key bindings.
 def _prompt_choice_ptk(prompt: str, valid: set[str], default: Optional[str]) -> str:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.key_binding import KeyBindings
@@ -326,6 +354,7 @@ def _prompt_choice_ptk(prompt: str, valid: set[str], default: Optional[str]) -> 
         typer.secho(f"Invalid choice: {result}", fg=typer.colors.RED)
 
 
+# Launch a new shell window for an authenticated session when supported.
 def _launch_shell_window(script_path: Path) -> bool:
     cmd = [sys.executable, str(script_path), "shell"]
     if os.name == "nt":
@@ -337,6 +366,7 @@ def _launch_shell_window(script_path: Path) -> bool:
     return False
 
 
+# Render an info panel (optional).
 def _render_status(title: str, lines: list[str]) -> None:
     if not lines:
         return
@@ -344,6 +374,7 @@ def _render_status(title: str, lines: list[str]) -> None:
     console.print(Panel(body, title=title, box=box.SIMPLE, expand=False))
 
 
+# Render a simple Rich table.
 def _render_table(title: str, columns: list[str], rows: list[list[str]]) -> None:
     table = Table(title=title, box=box.SIMPLE, show_lines=False)
     for col in columns:
@@ -353,6 +384,7 @@ def _render_table(title: str, columns: list[str], rows: list[list[str]]) -> None
     console.print(table)
 
 
+# Render a basic menu with optional status/footer lines.
 def _print_menu(
     title: str,
     options: list[tuple[str, str]],
@@ -370,6 +402,7 @@ def _print_menu(
         console.print("\n".join(footer_lines))
 
 
+# Fetch all messages visible to the current user.
 def _fetch_messages(state: dict, auth: dict) -> list[dict]:
     url = f"{_backend_url(state)}/api/messages"
     resp = _request("GET", url, token=auth["token"])
@@ -379,6 +412,7 @@ def _fetch_messages(state: dict, auth: dict) -> list[dict]:
     return resp.json()
 
 
+# Print a summary table of messages received by the user.
 def _list_received_messages(messages: list[dict], username: str) -> None:
     received = [msg for msg in messages if msg.get("recipient") == username]
     if not received:
@@ -393,6 +427,7 @@ def _list_received_messages(messages: list[dict], username: str) -> None:
     _render_table("Received Messages", ["#", "Time", "From", "Id"], rows)
 
 
+# Build a list of conversations sorted by most recent timestamp.
 def _conversation_list(messages: list[dict], username: str) -> list[tuple[str, str]]:
     latest_by_user: dict[str, str] = {}
     for msg in messages:
@@ -412,6 +447,7 @@ def _conversation_list(messages: list[dict], username: str) -> list[tuple[str, s
     return conversations
 
 
+# Prompt user to select a conversation from the list.
 def _select_conversation(conversations: list[tuple[str, str]]) -> Optional[str]:
     if not conversations:
         console.print("No conversations.")
@@ -431,6 +467,7 @@ def _select_conversation(conversations: list[tuple[str, str]]) -> Optional[str]:
         typer.secho("Invalid selection.", fg=typer.colors.RED)
 
 
+# Display a conversation (decrypting inbound messages when possible).
 def _display_conversation(
     messages: list[dict],
     username: str,
@@ -453,6 +490,7 @@ def _display_conversation(
     _render_table(f"Conversation with {with_user}", ["Time", "From", "To", "Message"], rows)
 
 
+# Produce table rows for a conversation, showing decrypted text when available.
 def _conversation_rows(
     convo: list[dict],
     username: str,
@@ -466,6 +504,7 @@ def _conversation_rows(
         created_at = msg.get("created_at", "unknown")
         if recipient == username:
             if private_key is None:
+                # Inbox remains locked until the user unlocks the private key locally.
                 plaintext = "[inbox locked]"
             else:
                 try:
@@ -478,11 +517,13 @@ def _conversation_rows(
                 except Exception:
                     plaintext = "[decryption failed]"
         else:
+            # Sent-message plaintext is stored locally only (server never sees it).
             plaintext = history.get(str(msg.get("id")), "[sent message not stored locally]")
         rows.append([created_at, sender, recipient, plaintext])
     return rows
 
 
+# Prompt once to unlock the private key (optional for reading inbox).
 def _unlock_private_key_once(state: dict) -> Optional[x25519.X25519PrivateKey]:
     if not state.get("keys", {}).get("encrypted_private_key"):
         typer.secho("No local private key found. Login to fetch it.", fg=typer.colors.RED)
@@ -502,6 +543,7 @@ def _unlock_private_key_once(state: dict) -> Optional[x25519.X25519PrivateKey]:
         return None
 
 
+# Set backend URL for subsequent API calls.
 @config_app.command("set-url")
 def config_set_url(url: str):
     state = _state()
@@ -510,6 +552,7 @@ def config_set_url(url: str):
     typer.echo(f"Backend URL set to {state['backend_url']}")
 
 
+# Show current configuration (masked by default).
 @config_app.command("show")
 def config_show(full: bool = typer.Option(False, "--full")):
     state = _state()
@@ -518,6 +561,7 @@ def config_show(full: bool = typer.Option(False, "--full")):
     typer.echo(json.dumps(state, indent=2))
 
 
+# Toggle local plaintext history storage.
 @config_app.command("set-history")
 def config_set_history(value: str):
     normalized = value.strip().lower()
@@ -535,6 +579,7 @@ def config_set_history(value: str):
     typer.echo(f"History saving set to {status}.")
 
 
+# Add or update a contact alias.
 @contacts_app.command("add")
 def contacts_add(alias: str, username: str):
     state = _state()
@@ -545,6 +590,7 @@ def contacts_add(alias: str, username: str):
     console.print(f"Saved contact {alias} -> {username}")
 
 
+# List saved contact aliases.
 @contacts_app.command("list")
 def contacts_list():
     state = _state()
@@ -556,6 +602,7 @@ def contacts_list():
     _render_table("Contacts", ["Alias", "Username"], rows)
 
 
+# Remove a saved contact alias.
 @contacts_app.command("remove")
 def contacts_remove(alias: str):
     state = _state()
@@ -569,6 +616,7 @@ def contacts_remove(alias: str):
     console.print(f"Removed contact {alias}.")
 
 
+# Call a Typer command and swallow Exit to keep the menu loop alive.
 def _safe_call(func, *args) -> bool:
     try:
         func(*args)
@@ -577,6 +625,7 @@ def _safe_call(func, *args) -> bool:
         return False
 
 
+# Launch the Textual TUI if available.
 def _run_tui() -> bool:
     try:
         from tui_app import run_tui
@@ -587,6 +636,7 @@ def _run_tui() -> bool:
     return True
 
 
+# Default entrypoint: launch TUI if no subcommand provided.
 @app.callback(invoke_without_command=True)
 def main(ctx: typer.Context):
     if ctx.invoked_subcommand is None:
@@ -594,12 +644,14 @@ def main(ctx: typer.Context):
             launcher()
 
 
+# Explicitly run the TUI.
 @app.command()
 def tui():
     if not _run_tui():
         raise typer.Exit(1)
 
 
+# Launcher with login/register flow and optional shell spawn.
 @app.command()
 def launcher():
     script_path = Path(__file__).resolve()
@@ -637,6 +689,7 @@ def launcher():
         raise typer.Exit()
 
 
+# Register a new user and upload public + encrypted private key.
 @app.command()
 def register(username: str):
     state = _state()
@@ -678,6 +731,7 @@ def register(username: str):
     typer.echo("Registered. Run 'login <username>' to get a token.")
 
 
+# Login and persist auth + server-side key blobs.
 @app.command()
 def login(username: str):
     state = _state()
@@ -708,7 +762,7 @@ def login(username: str):
     }
     _save_state(state)
 
-    # Validate password can decrypt the key
+    # Validate the supplied password can decrypt the stored private key blob.
     try:
         _decrypt_private_key(state["keys"]["encrypted_private_key"], password)
     except Exception:
@@ -717,6 +771,7 @@ def login(username: str):
     typer.echo("Login ok.")
 
 
+# Interactive shell menu for messaging actions.
 @app.command()
 def shell():
     state = _state()
@@ -767,6 +822,7 @@ def shell():
         raise typer.Exit()
 
 
+# Print the current username or "not logged in".
 @app.command()
 def whoami():
     state = _state()
@@ -777,6 +833,7 @@ def whoami():
         typer.echo("not logged in")
 
 
+# Clear local auth state.
 @app.command()
 def logout():
     state = _state()
@@ -785,6 +842,7 @@ def logout():
     typer.echo("Logged out.")
 
 
+# Send an encrypted message to a recipient.
 @app.command()
 def send(recipient: str, message: str, no_history: bool = typer.Option(False, "--no-history")):
     state = _state()
@@ -798,7 +856,7 @@ def send(recipient: str, message: str, no_history: bool = typer.Option(False, "-
         typer.secho("Failed to decrypt private key.", fg=typer.colors.RED)
         raise typer.Exit(1)
 
-    # Fetch recipient public key
+    # Fetch recipient public key for E2EE encryption.
     url = f"{_backend_url(state)}/api/users/{recipient}/public-key"
     resp = _request("GET", url, token=auth["token"])
     if resp.status_code != 200:
@@ -821,6 +879,7 @@ def send(recipient: str, message: str, no_history: bool = typer.Option(False, "-
         raise typer.Exit(1)
 
     msg_id = post_resp.json().get("id")
+    # Store outbound plaintext locally (optional) for easier conversation view.
     save_history = state.get("save_history", True) and not no_history
     _append_history(
         {
@@ -836,6 +895,7 @@ def send(recipient: str, message: str, no_history: bool = typer.Option(False, "-
     typer.echo(f"Message sent (id={msg_id}).")
 
 
+# List messages (optionally filtered by user).
 @app.command()
 def inbox(with_user: Optional[str] = typer.Option(None, "--with")):
     state = _state()
@@ -864,6 +924,7 @@ def inbox(with_user: Optional[str] = typer.Option(None, "--with")):
     _render_table("Messages", ["Id", "Time", "From", "To"], rows)
 
 
+# Read and decrypt a conversation with a given user.
 @app.command()
 def read(with_user: str):
     state = _state()
@@ -898,6 +959,7 @@ def read(with_user: str):
     _render_table(f"Conversation with {with_user}", ["Time", "From", "To", "Message"], rows)
 
 
+# Chat flow with simple paging and reply loop.
 def _chat_flow(
     state: dict,
     auth: dict,
@@ -917,6 +979,7 @@ def _chat_flow(
 
     messages.sort(key=lambda msg: msg.get("created_at", ""))
     history = _load_history()
+    # Page from the end by default (last 20 messages).
     page_size = 20
     start_index = max(len(messages) - page_size, 0)
 
@@ -944,6 +1007,7 @@ def _chat_flow(
             send(with_user, message)
 
 
+# Shortcut to chat with a user.
 @app.command()
 def chat(with_user: str):
     state = _state()
@@ -953,6 +1017,7 @@ def chat(with_user: str):
     _chat_flow(state, auth, with_user, private_key)
 
 
+# Append a plaintext history entry if enabled.
 def _append_history(entry: dict, save_history: bool = True) -> None:
     if not save_history:
         return
@@ -963,6 +1028,7 @@ def _append_history(entry: dict, save_history: bool = True) -> None:
         HISTORY_FILE.chmod(0o600)
 
 
+# Load plaintext history into a lookup map.
 def _load_history() -> dict:
     history = {}
     if not HISTORY_FILE.exists():

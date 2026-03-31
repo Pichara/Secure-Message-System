@@ -75,6 +75,7 @@ struct CorsConfig {
   std::unordered_set<std::string> allowed;
 };
 
+// Format the current UTC time as an ISO-8601 string for logs/metadata.
 std::string NowIso8601Utc() {
   using namespace std::chrono;
   auto now = system_clock::now();
@@ -90,6 +91,7 @@ std::string NowIso8601Utc() {
   return oss.str();
 }
 
+// Read an environment variable with a safe fallback.
 std::string GetEnvOrDefault(const char* key, const char* fallback) {
   const char* value = std::getenv(key);
   if (value && *value) {
@@ -98,6 +100,7 @@ std::string GetEnvOrDefault(const char* key, const char* fallback) {
   return std::string(fallback);
 }
 
+// Trim ASCII whitespace from both ends of a string.
 std::string Trim(const std::string& input) {
   size_t start = 0;
   while (start < input.size() &&
@@ -112,6 +115,7 @@ std::string Trim(const std::string& input) {
   return input.substr(start, end - start);
 }
 
+// Parse a comma-separated list into a set of trimmed values.
 std::unordered_set<std::string> SplitCsvToSet(const std::string& csv) {
   std::unordered_set<std::string> result;
   std::stringstream ss(csv);
@@ -125,6 +129,7 @@ std::unordered_set<std::string> SplitCsvToSet(const std::string& csv) {
   return result;
 }
 
+// Interpret common truthy strings (1/true/yes), case-insensitive.
 bool IsTruthy(const std::string& value) {
   std::string v;
   v.reserve(value.size());
@@ -134,10 +139,12 @@ bool IsTruthy(const std::string& value) {
   return v == "1" || v == "true" || v == "yes";
 }
 
+// Build the database connection URL from env.
 std::string GetDbUrl() {
   return GetEnvOrDefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/secure_message");
 }
 
+// Generate a random 256-bit token encoded as hex.
 std::string GenerateToken() {
   std::array<unsigned char, 32> bytes{};
   randombytes_buf(bytes.data(), bytes.size());
@@ -151,6 +158,7 @@ std::string GenerateToken() {
   return out;
 }
 
+// Pull "Authorization: Bearer <token>" from a request if present.
 std::optional<std::string> ExtractBearerToken(const httplib::Request& req) {
   auto auth = req.get_header_value("Authorization");
   const std::string prefix = "Bearer ";
@@ -160,6 +168,7 @@ std::optional<std::string> ExtractBearerToken(const httplib::Request& req) {
   return auth.substr(prefix.size());
 }
 
+// Validate bearer token and return associated username when active.
 std::optional<std::string> ValidateToken(const httplib::Request& req,
                                          std::unordered_map<std::string, TokenInfo>& tokens,
                                          std::mutex& token_mu,
@@ -172,6 +181,7 @@ std::optional<std::string> ValidateToken(const httplib::Request& req,
   auto now = std::chrono::system_clock::now();
 
   std::lock_guard<std::mutex> lock(token_mu);
+  // Periodically sweep expired tokens to bound memory usage.
   if (now - last_cleanup > std::chrono::minutes(5)) {
     for (auto it = tokens.begin(); it != tokens.end();) {
       if (it->second.expires_at < now) {
@@ -193,6 +203,7 @@ std::optional<std::string> ValidateToken(const httplib::Request& req,
   return it->second.username;
 }
 
+// Validate usernames with a small safe character set.
 bool IsValidUsername(const std::string& username) {
   if (username.size() < kMinUsernameLen || username.size() > kMaxUsernameLen) {
     return false;
@@ -209,14 +220,17 @@ bool IsValidUsername(const std::string& username) {
   return true;
 }
 
+// Enforce basic length policy; complexity rules are client-side.
 bool IsValidPassword(const std::string& password) {
   return password.size() >= kMinPasswordLen && password.size() <= kMaxPasswordLen;
 }
 
+// Enforce size limits on untrusted string fields.
 bool IsFieldLengthValid(const std::string& value, size_t max_len) {
   return value.size() <= max_len;
 }
 
+// Reject overly large request bodies to limit abuse.
 bool CheckBodySize(const httplib::Request& req, httplib::Response& res) {
   if (req.body.size() > kMaxBodyBytes) {
     res.status = 413;
@@ -226,6 +240,7 @@ bool CheckBodySize(const httplib::Request& req, httplib::Response& res) {
   return true;
 }
 
+// Apply CORS policy; return false when the Origin is not permitted.
 bool ApplyCors(const httplib::Request& req, httplib::Response& res, const CorsConfig& cors) {
   const std::string origin = req.get_header_value("Origin");
   if (!origin.empty()) {
@@ -244,6 +259,7 @@ bool ApplyCors(const httplib::Request& req, httplib::Response& res, const CorsCo
   return true;
 }
 
+// Serve a static OpenAPI spec for docs and clients.
 std::string BuildOpenApiSpec() {
   static const std::string spec = R"JSON({
   "openapi": "3.0.3",
@@ -411,6 +427,7 @@ std::string BuildOpenApiSpec() {
   return spec;
 }
 
+// Create required tables if they do not exist yet.
 void EnsureSchema(pqxx::connection& conn) {
   pqxx::work txn(conn);
   txn.exec(R"(
@@ -439,6 +456,7 @@ void EnsureSchema(pqxx::connection& conn) {
   txn.commit();
 }
 
+// Fetch a user record by username (or nullopt if not found).
 std::optional<DbUser> GetUserByUsername(pqxx::connection& conn, const std::string& username) {
   pqxx::work txn(conn);
   pqxx::result r = txn.exec_params(
@@ -457,6 +475,7 @@ std::optional<DbUser> GetUserByUsername(pqxx::connection& conn, const std::strin
   return user;
 }
 
+// Configure the server, routes, and start listening.
 int main() {
   if (sodium_init() < 0) {
     std::fprintf(stderr, "Failed to initialize libsodium.\n");
@@ -946,6 +965,7 @@ int main() {
     if (order == "desc") {
       order_sql = "DESC";
     }
+    // Pagination: server-enforced max limit with optional client override.
     int limit = 200;
     if (!limit_param.empty()) {
       try {
@@ -957,6 +977,7 @@ int main() {
         // Ignore invalid limit.
       }
     }
+    // "before_id" provides keyset pagination by message id.
     std::optional<int> before_id;
     if (!before_id_param.empty()) {
       try {
