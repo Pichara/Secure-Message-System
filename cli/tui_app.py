@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import base64
-import json
-import mimetypes
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,12 +15,16 @@ from secure_message_cli import (
     _append_history,
     _auth_valid,
     _backend_url,
+    _build_attachment_envelope,
     _decrypt_message,
     _encrypt_message,
     _encrypt_private_key,
+    _format_message_log_line,
     _generate_keypair,
+    _history_display,
     _load_history,
     _load_private_key_from_state,
+    _message_content,
     _request,
     _resolve_alias,
     _serialize_private_key,
@@ -38,11 +39,15 @@ class AuthState:
     token: str
     username: str
     role: str = "user"
+    private_key: object | None = None
 
 
-MAX_IMAGE_BYTES = 128 * 1024
 PASSWORD_RULE_HINT = "Password must be 8-128 characters and include at least one number and one special character."
 ADMIN_USERNAME = "ADMIN"
+
+
+def _is_dedicated_admin(auth: AuthState) -> bool:
+    return auth.role == "admin" and auth.username == ADMIN_USERNAME
 
 
 def _registration_password_message(password: str) -> Optional[str]:
@@ -56,84 +61,9 @@ def _registration_password_message(password: str) -> Optional[str]:
     return None
 
 
-def _detect_image_mime(data: bytes) -> Optional[str]:
-    """Recognize a small set of image formats without trusting file extensions."""
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if data.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if data.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
-        return "image/webp"
-    return None
-
-
-def _build_image_message(path_value: str, caption: str = "") -> str:
-    """Package a local image into a JSON envelope that can ride over the existing E2EE path."""
-    path = Path(path_value).expanduser()
-    if not path.is_file():
-        raise ValueError("Image file not found.")
-
-    raw = path.read_bytes()
-    if not raw:
-        raise ValueError("Image file is empty.")
-    if len(raw) > MAX_IMAGE_BYTES:
-        raise ValueError(f"Image must be {MAX_IMAGE_BYTES // 1024} KiB or smaller.")
-
-    mime = _detect_image_mime(raw) or mimetypes.guess_type(path.name)[0]
-    if mime not in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
-        raise ValueError("Only PNG, JPEG, GIF, and WebP images are supported.")
-
-    payload = {
-        "kind": "image",
-        "caption": caption.strip(),
-        "attachment": {
-            "name": path.name,
-            "mime": mime,
-            "size_bytes": len(raw),
-            "bytes_b64": base64.b64encode(raw).decode("ascii"),
-        },
-    }
-    return json.dumps(payload, separators=(",", ":"))
-
-
-def _parse_image_message(plaintext: str) -> Optional[dict]:
-    """Best-effort parse of the attachment envelope while remaining compatible with legacy text."""
-    try:
-        payload = json.loads(plaintext)
-    except Exception:
-        return None
-    if not isinstance(payload, dict) or payload.get("kind") != "image":
-        return None
-    attachment = payload.get("attachment")
-    if not isinstance(attachment, dict):
-        return None
-    if not attachment.get("name") or not attachment.get("mime"):
-        return None
-    return payload
-
-
 def _format_plaintext(plaintext: str) -> str:
-    """Render text messages normally and image envelopes as compact metadata."""
-    attachment = _parse_image_message(plaintext)
-    if not attachment:
-        return plaintext
-
-    meta = attachment["attachment"]
-    size_bytes = meta.get("size_bytes")
-    if not isinstance(size_bytes, int):
-        data_b64 = meta.get("bytes_b64") or meta.get("bytes_base64") or ""
-        try:
-            size_bytes = len(base64.b64decode(data_b64))
-        except Exception:
-            size_bytes = 0
-    size_label = f"{size_bytes} bytes" if size_bytes else "size unknown"
-    caption = str(attachment.get("caption") or "").strip()
-    summary = f"[image] {meta.get('name')} ({meta.get('mime')}, {size_label})"
-    if caption:
-        summary = f"{summary} caption={caption}"
-    return summary
+    """Render text messages normally and attachment envelopes as compact metadata."""
+    return str(_message_content(plaintext).get("display") or plaintext)
 
 
 class UserListScreen(ModalScreen[None]):
@@ -297,8 +227,13 @@ class AuthScreen(Screen):
             "public_key": me["public_key"],
             "encrypted_private_key": me["encrypted_private_key"],
         }
+        try:
+            private_key = _load_private_key_from_state(state, password)
+        except Exception:
+            self._set_status("Login ok, but failed to decrypt the local private key.")
+            return None
         _save_state(state)
-        return AuthState(token=token, username=username, role=role)
+        return AuthState(token=token, username=username, role=role, private_key=private_key)
 
     def _register(self, username: str, password: str, confirm: str) -> bool:
         """Register a user by generating a keypair and uploading only public + encrypted private key."""
@@ -360,7 +295,126 @@ class AuthScreen(Screen):
             auth = self._login(username, password)
             if not auth:
                 return
+            if _is_dedicated_admin(auth):
+                self.app.push_screen(AdminDirectoryScreen(auth))
+                return
             self.app.push_screen(MessageScreen(auth))
+
+
+class AdminDirectoryScreen(Screen):
+    """Read-only ADMIN view that only lists registered users."""
+
+    BINDINGS = [
+        ("r", "refresh", "Refresh"),
+        ("l", "logout", "Logout"),
+    ]
+
+    CSS = """
+    #admin-directory {
+        width: 70%;
+        min-width: 48;
+        height: auto;
+        margin: 3 10;
+        padding: 1 2;
+        border: round #4c4c4c;
+    }
+    #admin-session-meta {
+        color: #b0b0b0;
+        margin-bottom: 1;
+    }
+    #admin-user-log {
+        height: 18;
+        border: round #4c4c4c;
+        margin: 1 0;
+    }
+    #admin-actions {
+        height: auto;
+    }
+    #admin-status {
+        color: #b0b0b0;
+        margin-top: 1;
+    }
+    """
+
+    def __init__(self, auth: AuthState) -> None:
+        super().__init__()
+        self.auth = auth
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Container(id="admin-directory"):
+            yield Static("", id="admin-session-meta")
+            yield Static("Registered Users", id="admin-title")
+            yield RichLog(id="admin-user-log", wrap=True)
+            with Horizontal(id="admin-actions"):
+                yield Button("Refresh", id="refresh", variant="primary")
+                yield Button("Logout", id="logout")
+        yield Static("", id="admin-status")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#admin-session-meta", Static).update(
+            f"Signed in as {self.auth.username} (admin)"
+        )
+        self.action_refresh()
+
+    def _set_status(self, message: str) -> None:
+        self.query_one("#admin-status", Static).update(message)
+
+    def _show_users(self, usernames: list[str]) -> None:
+        log = self.query_one("#admin-user-log", RichLog)
+        log.clear()
+        if not usernames:
+            log.write("No users returned.")
+            return
+        for username in usernames:
+            log.write(username)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "refresh":
+            self.action_refresh()
+            return
+        if event.button.id == "logout":
+            self.action_logout()
+
+    def action_refresh(self) -> None:
+        state = _state()
+        auth = state.get("auth") or {}
+        resp = _request(
+            "GET",
+            f"{_backend_url(state)}/api/admin/users",
+            token=auth.get("token"),
+        )
+        if resp.status_code == 401:
+            self._set_status("Session expired. Please login again.")
+            self.app.push_screen(AuthScreen())
+            return
+        if resp.status_code == 403:
+            self._set_status("Admin access denied by server.")
+            return
+        if resp.status_code != 200:
+            self._set_status(f"Failed to load users: {resp.text}")
+            return
+
+        payload = resp.json()
+        raw_users = payload.get("users", payload)
+        usernames: list[str] = []
+        if isinstance(raw_users, list):
+            for entry in raw_users:
+                if isinstance(entry, dict) and entry.get("username"):
+                    usernames.append(str(entry["username"]))
+                elif isinstance(entry, str):
+                    usernames.append(entry)
+
+        usernames.sort()
+        self._show_users(usernames)
+        self._set_status(f"Loaded {len(usernames)} users.")
+
+    def action_logout(self) -> None:
+        state = _state()
+        state["auth"] = {}
+        _save_state(state)
+        self.app.push_screen(AuthScreen())
 
 
 class MessageScreen(Screen):
@@ -369,8 +423,6 @@ class MessageScreen(Screen):
     BINDINGS = [
         ("n", "new_chat", "New chat"),
         ("r", "refresh", "Refresh"),
-        ("u", "unlock", "Unlock inbox"),
-        ("i", "attach_image", "Attach image"),
         ("l", "logout", "Logout"),
     ]
 
@@ -423,7 +475,7 @@ class MessageScreen(Screen):
         """Initialize per-screen session state (token + in-memory decrypted private key)."""
         super().__init__()
         self.auth = auth
-        self.private_key = None
+        self.private_key = auth.private_key
         self.current_with: Optional[str] = None
 
     def _can_view_admin_users(self) -> bool:
@@ -440,7 +492,6 @@ class MessageScreen(Screen):
                 with Horizontal(id="contact-actions"):
                     yield Button("New chat", id="new-chat", variant="primary")
                     yield Button("Refresh", id="refresh")
-                    yield Button("Unlock", id="unlock")
                     if self._can_view_admin_users():
                         yield Button("Users", id="admin-users")
                 yield ListView(id="contact-list")
@@ -450,7 +501,7 @@ class MessageScreen(Screen):
                 with Container(id="compose-box"):
                     yield Input(placeholder="Type message and press Enter", id="compose")
                     with Horizontal(id="compose-actions"):
-                        yield Button("Attach image", id="attach-image")
+                        yield Button("Attach file", id="attach-file")
                         yield Button("Logout", id="logout")
         yield Static("", id="status")
         yield Footer()
@@ -558,8 +609,7 @@ class MessageScreen(Screen):
             created_at = msg.get("created_at", "unknown")
             if recipient == auth.get("username"):
                 if self.private_key is None:
-                    # Inbox remains locked until the user decrypts their private key locally.
-                    plaintext = "[inbox locked]"
+                    plaintext = "[message unavailable]"
                 else:
                     try:
                         plaintext = _decrypt_message(
@@ -572,8 +622,15 @@ class MessageScreen(Screen):
                         plaintext = "[decryption failed]"
             else:
                 # Sent-message plaintext is only stored locally (optional); server stores ciphertext only.
-                plaintext = history.get(str(msg.get("id")), "[sent message not stored locally]")
-            log.write(f"{created_at} {sender} -> {recipient}: {_format_plaintext(plaintext)}")
+                plaintext = _history_display(history, msg.get("id"))
+            log.write(
+                _format_message_log_line(
+                    created_at,
+                    sender,
+                    recipient,
+                    _format_plaintext(plaintext),
+                )
+            )
 
         self.query_one("#compose", Input).disabled = False
         self.query_one("#compose", Input).focus()
@@ -651,11 +708,8 @@ class MessageScreen(Screen):
         if event.button.id == "refresh":
             self.action_refresh()
             return
-        if event.button.id == "unlock":
-            self.action_unlock()
-            return
-        if event.button.id == "attach-image":
-            self.action_attach_image()
+        if event.button.id == "attach-file":
+            self.action_attach_file()
             return
         if event.button.id == "admin-users":
             self.action_admin_users()
@@ -721,33 +775,14 @@ class MessageScreen(Screen):
             self._render_conversation(self.current_with)
 
     @work(exclusive=True)
-    async def action_unlock(self) -> None:
-        """Decrypt the private key into memory so inbound messages can be decrypted in the UI."""
-        password = await self.app.push_screen(
-            InputDialog("Unlock inbox", "password", password=True),
-            wait_for_dismiss=True,
-        )
-        if not password:
-            return
-        state = _state()
-        try:
-            # Decrypted private key is intentionally kept in-memory only for this session/screen.
-            self.private_key = _load_private_key_from_state(state, password)
-            self._set_status("Inbox unlocked.")
-            if self.current_with:
-                self._render_conversation(self.current_with)
-        except Exception:
-            self._set_status("Failed to decrypt private key.")
-
-    @work(exclusive=True)
-    async def action_attach_image(self) -> None:
-        """Prompt for an image path and optional caption, then send it as an encrypted attachment envelope."""
+    async def action_attach_file(self) -> None:
+        """Prompt for a file path and optional caption, then send it as an encrypted attachment envelope."""
         if not self.current_with:
-            self._set_status("Select a conversation before attaching an image.")
+            self._set_status("Select a conversation before attaching a file.")
             return
 
         path_value = await self.app.push_screen(
-            InputDialog("Attach image", "C:\\path\\to\\image.png"),
+            InputDialog("Attach file", "C:\\path\\to\\file.ext"),
             wait_for_dismiss=True,
         )
         if not path_value:
@@ -759,9 +794,12 @@ class MessageScreen(Screen):
         )
 
         try:
-            message = _build_image_message(path_value, caption or "")
+            message, _ = _build_attachment_envelope(Path(path_value).expanduser(), caption or "")
         except ValueError as exc:
             self._set_status(str(exc))
+            return
+        except OSError as exc:
+            self._set_status(f"Failed to read attachment: {exc}")
             return
         self._send_payload(message)
 

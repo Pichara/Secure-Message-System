@@ -53,15 +53,15 @@ def _auth_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _image_envelope(filename: str = "photo.png", caption: str = "test image") -> dict:
-    image_bytes = b"\x89PNG\r\n\x1a\nworker4-test-image"
+def _file_envelope(filename: str = "evidence.bin", caption: str = "test file") -> dict:
+    file_bytes = b"worker4-test-file-payload"
     return {
-        "kind": "image",
+        "kind": "file",
         "caption": caption,
         "attachment": {
             "name": filename,
-            "mime": "image/png",
-            "bytes_b64": base64.b64encode(image_bytes).decode("ascii"),
+            "mime": "application/octet-stream",
+            "bytes_b64": base64.b64encode(file_bytes).decode("ascii"),
         },
     }
 
@@ -135,12 +135,12 @@ def test_attachment_envelope_round_trip_preserves_text_compatibility():
     decrypted_text = _decrypt_message(ciphertext, iv, encrypted_key, recipient_private)
     assert decrypted_text == legacy_text
 
-    envelope = _image_envelope()
+    envelope = _file_envelope()
     encrypted_key, ciphertext, iv = _encrypt_message(json.dumps(envelope), recipient_public_b64)
     decrypted_attachment = _decrypt_message(ciphertext, iv, encrypted_key, recipient_private)
     decoded = json.loads(decrypted_attachment)
 
-    assert decoded["kind"] == "image"
+    assert decoded["kind"] == "file"
     assert decoded["caption"] == envelope["caption"]
     assert decoded["attachment"]["name"] == envelope["attachment"]["name"]
     assert decoded["attachment"]["mime"] == envelope["attachment"]["mime"]
@@ -150,7 +150,7 @@ def test_attachment_envelope_round_trip_preserves_text_compatibility():
 
 
 @pytest.mark.e2e
-def test_e2e_image_attachment_flow_preserves_text_message_compatibility():
+def test_e2e_file_attachment_flow_preserves_text_message_compatibility():
     if not _health_check():
         pytest.skip("Backend is not reachable")
 
@@ -187,7 +187,7 @@ def test_e2e_image_attachment_flow_preserves_text_message_compatibility():
     )
     assert resp.status_code == 201
 
-    attachment_plaintext = json.dumps(_image_envelope(caption="release screenshot"))
+    attachment_plaintext = json.dumps(_file_envelope(caption="release artifact"))
     encrypted_key, ciphertext, iv = _encrypt_message(attachment_plaintext, recipient_public_b64)
     resp = requests.post(
         f"{BACKEND_URL}/api/messages",
@@ -218,7 +218,7 @@ def test_e2e_image_attachment_flow_preserves_text_message_compatibility():
 
     assert decrypted_payloads[0] == text_plaintext
     attachment = json.loads(decrypted_payloads[1])
-    assert attachment["kind"] == "image"
-    assert attachment["caption"] == "release screenshot"
-    assert attachment["attachment"]["mime"] == "image/png"
-    assert base64.b64decode(attachment["attachment"]["bytes_b64"]).startswith(b"\x89PNG\r\n\x1a\n")
+    assert attachment["kind"] == "file"
+    assert attachment["caption"] == "release artifact"
+    assert attachment["attachment"]["mime"] == "application/octet-stream"
+    assert base64.b64decode(attachment["attachment"]["bytes_b64"]) == b"worker4-test-file-payload"

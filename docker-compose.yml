@@ -14,6 +14,7 @@ services:
   backend:
     build:
       context: ./backend
+      dockerfile: Dockerfile
     container_name: secure-message-backend
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/secure_message

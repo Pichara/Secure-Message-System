@@ -42,6 +42,7 @@ HISTORY_FILE = STATE_DIR / "history.jsonl"
 DEFAULT_BACKEND_URL = "http://localhost:8080"
 PBKDF2_ITERATIONS = 200_000
 MAX_ATTACHMENT_BYTES = 128 * 1024
+ADMIN_USERNAME = "ADMIN"
 PASSWORD_POLICY_MESSAGE = (
     "Password must be 8-128 characters and include at least one number "
     "and one special character."
@@ -185,6 +186,19 @@ def _auth_valid(auth: dict) -> bool:
 def _auth_role(auth: dict) -> str:
     role = str(auth.get("role") or "user").strip().lower()
     return role or "user"
+
+
+def _admin_session_only_lists_users(auth: dict) -> bool:
+    return _auth_role(auth) == "admin" and str(auth.get("username") or "") == ADMIN_USERNAME
+
+
+def _require_non_admin_messaging(auth: dict) -> None:
+    if _admin_session_only_lists_users(auth):
+        typer.secho(
+            "ADMIN is limited to listing users. Run 'admin users' instead.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(1)
 
 
 # Derive a symmetric key from password + salt using PBKDF2.
@@ -334,25 +348,26 @@ def _detect_image_type(data: bytes) -> Optional[tuple[str, str]]:
     return None
 
 
-def _build_image_envelope(file_path: Path, caption: Optional[str]) -> tuple[str, dict[str, Any]]:
+def _build_attachment_envelope(file_path: Path, caption: Optional[str]) -> tuple[str, dict[str, Any]]:
     raw_bytes = file_path.read_bytes()
     if not raw_bytes:
-        raise ValueError("Image file is empty.")
+        raise ValueError("Attachment file is empty.")
     if len(raw_bytes) > MAX_ATTACHMENT_BYTES:
-        raise ValueError(f"Image exceeds {MAX_ATTACHMENT_BYTES} bytes.")
+        raise ValueError(f"Attachment exceeds {MAX_ATTACHMENT_BYTES} bytes.")
 
     detected = _detect_image_type(raw_bytes)
-    if detected is None:
-        raise ValueError("Unsupported image type. Use PNG, JPEG, GIF, or WebP.")
-    mime, fallback_suffix = detected
+    mime = (detected[0] if detected else None) or mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    fallback_suffix = file_path.suffix or (detected[1] if detected else "") or mimetypes.guess_extension(mime) or ".bin"
 
-    file_name = _safe_filename(file_path.name or f"image{fallback_suffix}", fallback=f"image{fallback_suffix}")
+    file_name = _safe_filename(
+        file_path.name or f"attachment{fallback_suffix}",
+        fallback=f"attachment{fallback_suffix}",
+    )
     if not Path(file_name).suffix:
-        guessed_ext = mimetypes.guess_extension(mime) or fallback_suffix
-        file_name = f"{file_name}{guessed_ext}"
+        file_name = f"{file_name}{fallback_suffix}"
 
     envelope = {
-        "kind": "image",
+        "kind": "attachment",
         "caption": (caption or "").strip(),
         "attachment": {
             "name": file_name,
@@ -370,20 +385,24 @@ def _build_image_envelope(file_path: Path, caption: Optional[str]) -> tuple[str,
     return json.dumps(envelope), metadata
 
 
+def _build_image_envelope(file_path: Path, caption: Optional[str]) -> tuple[str, dict[str, Any]]:
+    return _build_attachment_envelope(file_path, caption)
+
+
 def _message_content(raw_content: str) -> dict[str, Any]:
     try:
         payload = json.loads(raw_content)
     except json.JSONDecodeError:
         return {"kind": "text", "raw": raw_content, "display": raw_content}
 
-    if not isinstance(payload, dict) or payload.get("kind") != "image":
+    if not isinstance(payload, dict) or payload.get("kind") not in {"attachment", "image", "file"}:
         return {"kind": "text", "raw": raw_content, "display": raw_content}
 
     attachment = payload.get("attachment")
     if not isinstance(attachment, dict):
         return {"kind": "text", "raw": raw_content, "display": raw_content}
 
-    name = _safe_filename(str(attachment.get("name") or "image.bin"))
+    name = _safe_filename(str(attachment.get("name") or "attachment.bin"))
     mime = str(attachment.get("mime") or "application/octet-stream")
     size_bytes = attachment.get("size_bytes")
     caption = str(payload.get("caption") or "").strip()
@@ -395,12 +414,12 @@ def _message_content(raw_content: str) -> dict[str, Any]:
         except Exception:
             size_bytes = 0
 
-    display = f"[image] {name} ({mime}, {size_bytes} bytes)"
+    display = f"[attachment] {name} ({mime}, {size_bytes} bytes)"
     if caption:
         display = f"{display} caption={caption}"
 
     return {
-        "kind": "image",
+        "kind": "attachment",
         "raw": raw_content,
         "display": display,
         "name": name,
@@ -409,6 +428,21 @@ def _message_content(raw_content: str) -> dict[str, Any]:
         "caption": caption,
         "bytes_b64": bytes_b64,
     }
+
+
+def _format_message_timestamp(value: Any) -> str:
+    text = str(value or "unknown")
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return text.replace("T", " ").split(".", 1)[0]
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_message_log_line(created_at: Any, sender: Any, recipient: Any, message: Any) -> str:
+    timestamp = _format_message_timestamp(created_at)
+    return f"{timestamp} ({sender} -> {recipient}:) {message}"
 
 
 def _history_entry_from_record(entry: dict) -> Optional[dict[str, Any]]:
@@ -692,7 +726,7 @@ def _list_received_messages(messages: list[dict], username: str) -> None:
         return
     rows = []
     for idx, msg in enumerate(received, start=1):
-        created_at = msg.get("created_at", "unknown")
+        created_at = _format_message_timestamp(msg.get("created_at", "unknown"))
         sender = msg.get("sender", "unknown")
         msg_id = str(msg.get("id", "?"))
         rows.append([str(idx), created_at, sender, msg_id])
@@ -726,7 +760,7 @@ def _select_conversation(conversations: list[tuple[str, str]]) -> Optional[str]:
         return None
     rows = []
     for idx, (user, latest) in enumerate(conversations, start=1):
-        rows.append([str(idx), user, latest or "-"])
+        rows.append([str(idx), user, _format_message_timestamp(latest or "-")])
     _render_table("Conversations", ["#", "User", "Last Message"], rows)
     while True:
         choice = typer.prompt("Open conversation (0 to back)").strip()
@@ -793,7 +827,7 @@ def _conversation_rows(
         else:
             # Sent-message plaintext is stored locally only (server never sees it).
             plaintext = _history_display(history, msg.get("id"))
-        rows.append([msg_id, created_at, sender, recipient, plaintext])
+        rows.append([msg_id, _format_message_timestamp(created_at), sender, recipient, plaintext])
     return rows
 
 
@@ -881,9 +915,10 @@ def admin_users():
 def attachments_show(message_id: int):
     state = _state()
     auth = _require_auth(state)
+    _require_non_admin_messaging(auth)
     content, source = _message_content_for_id(state, auth, message_id)
-    if content.get("kind") != "image":
-        typer.secho("Message is not an image attachment.", fg=typer.colors.RED)
+    if content.get("kind") != "attachment":
+        typer.secho("Message is not an attachment.", fg=typer.colors.RED)
         raise typer.Exit(1)
 
     rows = [
@@ -901,9 +936,10 @@ def attachments_show(message_id: int):
 def attachments_save(message_id: int, output_path: Path):
     state = _state()
     auth = _require_auth(state)
+    _require_non_admin_messaging(auth)
     content, source = _message_content_for_id(state, auth, message_id)
-    if content.get("kind") != "image":
-        typer.secho("Message is not an image attachment.", fg=typer.colors.RED)
+    if content.get("kind") != "attachment":
+        typer.secho("Message is not an attachment.", fg=typer.colors.RED)
         raise typer.Exit(1)
 
     try:
@@ -921,6 +957,7 @@ def attachments_save(message_id: int, output_path: Path):
 def contacts_add(alias: str, username: str):
     state = _state()
     auth = _require_auth(state)
+    _require_non_admin_messaging(auth)
     payload = {"alias": alias.strip(), "username": username.strip()}
     resp = _request("POST", f"{_backend_url(state)}/api/contacts", token=auth["token"], json=payload)
     if resp.status_code != 201:
@@ -934,6 +971,7 @@ def contacts_add(alias: str, username: str):
 def contacts_list():
     state = _state()
     auth = _require_auth(state)
+    _require_non_admin_messaging(auth)
     contacts = _fetch_contacts(state, auth)
     if not contacts:
         console.print("No contacts saved.")
@@ -947,6 +985,7 @@ def contacts_list():
 def contacts_remove(alias: str):
     state = _state()
     auth = _require_auth(state)
+    _require_non_admin_messaging(auth)
     resp = _request(
         "DELETE",
         f"{_backend_url(state)}/api/contacts/{alias.strip()}",
@@ -1125,22 +1164,20 @@ def shell():
 
     username = auth["username"]
     role = _auth_role(auth)
-    private_key = _unlock_private_key_once(state)
+    private_key = None if _admin_session_only_lists_users(auth) else _unlock_private_key_once(state)
     while True:
         typer.echo("")
-        options = [("1", "Send message"), ("2", "View messages"), ("3", "Chat")]
-        valid_choices = {"1", "2", "3"}
-        footer = ["Press 1-4"]
-        if role == "admin":
-            options.append(("4", "List users"))
-            options.append(("5", "Exit"))
-            valid_choices.add("4")
-            valid_choices.add("5")
-            footer = ["Press 1-5"]
-            default_choice = "5"
+        if _admin_session_only_lists_users(auth):
+            options = [("1", "List users"), ("2", "Exit")]
+            valid_choices = {"1", "2"}
+            footer = ["Press 1-2"]
+            default_choice = "2"
         else:
+            options = [("1", "Send message"), ("2", "View messages"), ("3", "Chat")]
+            valid_choices = {"1", "2", "3"}
             options.append(("4", "Exit"))
             valid_choices.add("4")
+            footer = ["Press 1-4"]
             default_choice = "4"
         _print_menu(
             title="Secure Message Session",
@@ -1150,12 +1187,18 @@ def shell():
         )
         choice = _prompt_choice(f"{username}@secure>", valid_choices, default=default_choice)
 
+        if _admin_session_only_lists_users(auth):
+            if choice == "1":
+                admin_users()
+                continue
+            raise typer.Exit()
+
         if choice == "1":
             recipient = typer.prompt("Recipient").strip()
             if not recipient:
                 typer.secho("Recipient required.", fg=typer.colors.RED)
                 continue
-            attachment_path = typer.prompt("Image path (leave blank for text)", default="", show_default=False).strip()
+            attachment_path = typer.prompt("Attachment path (leave blank for text)", default="", show_default=False).strip()
             if attachment_path:
                 caption = typer.prompt("Caption (optional)", default="", show_default=False).strip()
                 send(recipient, caption or None, file=Path(attachment_path))
@@ -1181,9 +1224,6 @@ def shell():
                 continue
             with_user = _resolve_alias(state, with_user)
             _chat_flow(state, auth, with_user, private_key)
-            continue
-        if choice == "4" and role == "admin":
-            admin_users()
             continue
         raise typer.Exit()
 
@@ -1223,9 +1263,10 @@ def send(
 ):
     state = _state()
     auth = _require_auth(state)
+    _require_non_admin_messaging(auth)
     recipient = _resolve_alias(state, recipient)
     if file is None and not message:
-        typer.secho("Provide a message or use --file for an image attachment.", fg=typer.colors.RED)
+        typer.secho("Provide a message or use --file for an attachment.", fg=typer.colors.RED)
         raise typer.Exit(1)
     if file is not None and not file.exists():
         typer.secho("Attachment file not found.", fg=typer.colors.RED)
@@ -1251,9 +1292,9 @@ def send(
     if file is not None:
         attachment_caption = caption if caption is not None else (message or "")
         try:
-            content_to_encrypt, attachment_meta = _build_image_envelope(file, attachment_caption)
+            content_to_encrypt, attachment_meta = _build_attachment_envelope(file, attachment_caption)
         except OSError as exc:
-            typer.secho(f"Failed to read image: {exc}", fg=typer.colors.RED)
+            typer.secho(f"Failed to read attachment: {exc}", fg=typer.colors.RED)
             raise typer.Exit(1)
         except ValueError as exc:
             typer.secho(str(exc), fg=typer.colors.RED)
@@ -1293,7 +1334,7 @@ def send(
     )
 
     if file is not None:
-        typer.echo(f"Image sent (id={msg_id}, file={attachment_meta['name']}).")
+        typer.echo(f"Attachment sent (id={msg_id}, file={attachment_meta['name']}).")
         return
     typer.echo(f"Message sent (id={msg_id}).")
 
@@ -1303,6 +1344,7 @@ def send(
 def inbox(with_user: Optional[str] = typer.Option(None, "--with")):
     state = _state()
     auth = _require_auth(state)
+    _require_non_admin_messaging(auth)
     url = f"{_backend_url(state)}/api/messages"
     if with_user:
         with_user = _resolve_alias(state, with_user)
@@ -1332,6 +1374,7 @@ def inbox(with_user: Optional[str] = typer.Option(None, "--with")):
 def read(with_user: str):
     state = _state()
     auth = _require_auth(state)
+    _require_non_admin_messaging(auth)
     password = typer.prompt("Password", hide_input=True)
     with_user = _resolve_alias(state, with_user)
 
@@ -1360,7 +1403,15 @@ def read(with_user: str):
                 plaintext = "[decryption failed]"
         else:
             plaintext = _history_display(history, msg.get("id"))
-        rows.append([msg_id, msg["created_at"], msg["sender"], msg["recipient"], plaintext])
+        rows.append(
+            [
+                msg_id,
+                _format_message_timestamp(msg["created_at"]),
+                msg["sender"],
+                msg["recipient"],
+                plaintext,
+            ]
+        )
     _render_table(f"Conversation with {with_user}", ["Id", "Time", "From", "To", "Message"], rows)
 
 
@@ -1405,7 +1456,7 @@ def _chat_flow(
             start_index = max(start_index - page_size, 0)
             continue
         if choice == "r":
-            attachment_path = typer.prompt("Image path (leave blank for text)", default="", show_default=False).strip()
+            attachment_path = typer.prompt("Attachment path (leave blank for text)", default="", show_default=False).strip()
             if attachment_path:
                 caption = typer.prompt("Caption (optional)", default="", show_default=False).strip()
                 send(with_user, caption or None, file=Path(attachment_path))
@@ -1422,6 +1473,7 @@ def _chat_flow(
 def chat(with_user: str):
     state = _state()
     auth = _require_auth(state)
+    _require_non_admin_messaging(auth)
     with_user = _resolve_alias(state, with_user)
     private_key = _unlock_private_key_once(state)
     _chat_flow(state, auth, with_user, private_key)

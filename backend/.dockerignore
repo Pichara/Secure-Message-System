@@ -2,3 +2,8 @@
 /.git
 /.gitignore
 /.vscode
+/src
+/CMakeLists.txt
+Dockerfile.cpp
+*.cpp
+*.h

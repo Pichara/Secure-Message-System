@@ -488,6 +488,7 @@ std::string BuildOpenApiSpec() {
     "/api/admin/users": {
       "get": {
         "summary": "List all usernames (admin only)",
+        "description": "Returns the registered usernames only. This admin view is separate from the messaging flow.",
         "security": [ { "bearerAuth": [] } ],
         "responses": {
           "200": { "description": "List of usernames" },
@@ -517,7 +518,7 @@ std::string BuildOpenApiSpec() {
     "/api/messages": {
       "post": {
         "summary": "Send message",
-        "description": "Stores an opaque encrypted payload. The ciphertext may decrypt to plain text or to a client-defined attachment envelope for small images/files.",
+        "description": "Stores an opaque encrypted payload. The ciphertext may decrypt to plain text or to a client-defined attachment envelope for arbitrary files, including images.",
         "security": [ { "bearerAuth": [] } ],
         "requestBody": {
           "required": true,
@@ -750,7 +751,8 @@ int main() {
     </ul>
     <p>Protected endpoints require <code>Authorization: Bearer &lt;token&gt;</code>.</p>
     <p>New registrations require a password with 8-128 characters, at least one number, and at least one special character.</p>
-    <p>Message payloads are opaque encrypted blobs and may contain client-defined attachment envelopes for small images/files.</p>
+    <p>The admin user list is a separate protected endpoint and returns registered usernames only.</p>
+    <p>Message payloads are opaque encrypted blobs and may contain client-defined attachment envelopes for arbitrary files, including images.</p>
   </body>
 </html>
 )HTML";

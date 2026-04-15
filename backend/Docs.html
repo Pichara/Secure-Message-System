@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8"/>
+    <title>Secure Message API Docs</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 2rem; line-height: 1.5; }
+      code { background: #f3f3f3; padding: 2px 6px; border-radius: 4px; }
+      h1 { margin-bottom: 0.5rem; }
+      .muted { color: #666; }
+      ul { margin-top: 0.5rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Secure Message API</h1>
+    <div class="muted">OpenAPI spec: <a href="/openapi.json">/openapi.json</a></div>
+    <h2>Endpoints</h2>
+    <ul>
+      <li><code>GET /health</code></li>
+      <li><code>POST /api/register</code></li>
+      <li><code>POST /api/login</code></li>
+      <li><code>POST /api/logout</code></li>
+      <li><code>GET /api/me</code></li>
+      <li><code>GET /api/contacts</code></li>
+      <li><code>POST /api/contacts</code></li>
+      <li><code>DELETE /api/contacts/{alias}</code></li>
+      <li><code>GET /api/admin/users</code> (admin only)</li>
+      <li><code>GET /api/users/{username}/public-key</code></li>
+      <li><code>POST /api/messages</code></li>
+      <li><code>GET /api/messages</code> (with, limit, order, before_id)</li>
+    </ul>
+    <p>Protected endpoints require <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+    <p>New registrations require a password with 8-128 characters, at least one number, and at least one special character.</p>
+    <p>The admin user list is a separate protected endpoint and returns registered usernames only.</p>
+    <p>Message payloads are opaque encrypted blobs and may contain client-defined attachment envelopes for arbitrary files, including images.</p>
+  </body>
+</html>

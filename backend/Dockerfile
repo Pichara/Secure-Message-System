@@ -1,36 +1,28 @@
-FROM ubuntu:22.04 AS build
-
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends \
-     build-essential \
-     cmake \
-     git \
-     ca-certificates \
-     pkg-config \
-     libpq-dev \
-     libpqxx-dev \
-     libsodium-dev \
-  && rm -rf /var/lib/apt/lists/*
-
+# Build stage
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /app
-COPY CMakeLists.txt ./
-COPY src ./src
 
-RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-RUN cmake --build build -j
+# Clear any NuGet config that might have been copied
+RUN rm -f ~/.nuget/NuGet/NuGet.Config
 
-FROM ubuntu:22.04
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends \
-     libpq5 \
-     libpqxx-dev \
-     libsodium23 \
-  && rm -rf /var/lib/apt/lists/*
+# Copy project file and restore dependencies
+COPY SecureMessageBackend.csproj ./
+RUN dotnet restore
 
+# Copy all source files
+COPY . ./
+
+# Build the project
+RUN dotnet publish -c Release -o /app/publish
+
+# Runtime stage
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
 WORKDIR /app
-COPY --from=build /app/build/secure_message_backend /app/secure_message_backend
 
 EXPOSE 8080
 ENV PORT=8080
 
-CMD ["/app/secure_message_backend"]
+# Copy the published output from the build stage
+COPY --from=build /app/publish ./
+
+CMD ["dotnet", "SecureMessageBackend.dll"]

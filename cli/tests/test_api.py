@@ -318,6 +318,7 @@ def test_api_admin_user_listing_requires_admin_and_returns_usernames_only():
     payload = resp.json()
     assert set(payload.keys()) == {"users"}
     usernames = [user["username"] for user in payload["users"]]
+    assert len(usernames) == len(set(usernames))
     assert admin_username in usernames
     assert member_username in usernames
     for user in payload["users"]:
