@@ -643,22 +643,22 @@ class MessageScreen(Screen):
         if self._send_payload(message):
             event.input.value = ""
 
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
+    def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle on-screen buttons (keyboard shortcuts are handled by Textual actions)."""
         if event.button.id == "new-chat":
-            await self.action_new_chat()
+            self.action_new_chat()
             return
         if event.button.id == "refresh":
             self.action_refresh()
             return
         if event.button.id == "unlock":
-            await self.action_unlock()
+            self.action_unlock()
             return
         if event.button.id == "attach-image":
-            await self.action_attach_image()
+            self.action_attach_image()
             return
         if event.button.id == "admin-users":
-            await self.action_admin_users()
+            self.action_admin_users()
             return
         if event.button.id == "logout":
             self.action_logout()
