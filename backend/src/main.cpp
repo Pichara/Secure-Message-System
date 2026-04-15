@@ -1,7 +1,8 @@
 #include <httplib.h>
-#include <json.hpp>
+#include <nlohmann/json.hpp>
 #include <pqxx/pqxx>
 #include <sodium.h>
+
 #include <array>
 #include <algorithm>
 #include <cctype>
@@ -32,9 +33,15 @@ struct DbUser {
   std::string password_hash;
   std::string public_key;
   std::string encrypted_private_key;
+  std::string role = "user";
 };
 
-constexpr size_t kMaxBodyBytes = 256 * 1024;
+struct DbContact {
+  std::string alias;
+  std::string username;
+};
+
+constexpr size_t kMaxBodyBytes = 2 * 1024 * 1024;
 constexpr size_t kMinUsernameLen = 3;
 constexpr size_t kMaxUsernameLen = 32;
 constexpr size_t kMinPasswordLen = 8;
@@ -42,8 +49,15 @@ constexpr size_t kMaxPasswordLen = 128;
 constexpr size_t kMaxPublicKeyLen = 512;
 constexpr size_t kMaxEncryptedPrivateKeyLen = 8192;
 constexpr size_t kMaxEncryptedKeyLen = 4096;
-constexpr size_t kMaxCiphertextLen = 16384;
+constexpr size_t kMaxCiphertextLen = 1536 * 1024;
 constexpr size_t kMaxIvLen = 128;
+constexpr const char* kUserRole = "user";
+constexpr const char* kAdminRole = "admin";
+constexpr const char* kAdminUsername = "ADMIN";
+constexpr const char* kBootstrapAdminPassword = "Password!123";
+constexpr const char* kBootstrapAdminPublicKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+constexpr const char* kBootstrapAdminEncryptedPrivateKey =
+    R"({"ciphertext":"","salt":"","nonce":""})";
 
 struct RateLimitEntry {
   int count = 0;
@@ -219,9 +233,70 @@ bool IsValidUsername(const std::string& username) {
   return true;
 }
 
-// Enforce basic length policy; complexity rules are client-side.
+std::string PasswordPolicyMessage() {
+  return "password must be 8-128 characters and include at least one number and one special character";
+}
+
+// Enforce registration-time password complexity for newly created accounts only.
 bool IsValidPassword(const std::string& password) {
-  return password.size() >= kMinPasswordLen && password.size() <= kMaxPasswordLen;
+  if (password.size() < kMinPasswordLen || password.size() > kMaxPasswordLen) {
+    return false;
+  }
+
+  bool has_digit = false;
+  bool has_special = false;
+  for (char ch : password) {
+    const auto uch = static_cast<unsigned char>(ch);
+    if (std::isdigit(uch)) {
+      has_digit = true;
+      continue;
+    }
+    if (!std::isalnum(uch) && !std::isspace(uch)) {
+      has_special = true;
+    }
+  }
+  return has_digit && has_special;
+}
+
+bool IsAdminRole(const std::string& role) {
+  return role == kAdminRole;
+}
+
+void EnsureBootstrapAdminAccount(pqxx::connection& conn) {
+  char hash[crypto_pwhash_STRBYTES];
+  const std::string password = kBootstrapAdminPassword;
+  if (crypto_pwhash_str(
+          hash,
+          password.c_str(),
+          password.size(),
+          crypto_pwhash_OPSLIMIT_MODERATE,
+          crypto_pwhash_MEMLIMIT_MODERATE) != 0) {
+    throw std::runtime_error("Failed to hash bootstrap admin password.");
+  }
+
+  pqxx::work txn(conn);
+  pqxx::result existing = txn.exec_params(
+      "SELECT id FROM users WHERE username = $1",
+      std::string(kAdminUsername));
+
+  if (existing.empty()) {
+    txn.exec_params(
+        "INSERT INTO users (username, password_hash, public_key, encrypted_private_key, role) "
+        "VALUES ($1, $2, $3, $4, $5)",
+        std::string(kAdminUsername),
+        std::string(hash),
+        std::string(kBootstrapAdminPublicKey),
+        std::string(kBootstrapAdminEncryptedPrivateKey),
+        std::string(kAdminRole));
+  } else {
+    txn.exec_params(
+        "UPDATE users SET password_hash = $2, role = $3 WHERE username = $1",
+        std::string(kAdminUsername),
+        std::string(hash),
+        std::string(kAdminRole));
+  }
+
+  txn.commit();
 }
 
 // Enforce size limits on untrusted string fields.
@@ -264,8 +339,8 @@ std::string BuildOpenApiSpec() {
   "openapi": "3.0.3",
   "info": {
     "title": "Secure Message API",
-    "version": "1.0.0",
-    "description": "Backend API for the Secure Message System."
+    "version": "1.1.0",
+    "description": "Backend API for the Secure Message System. The server stores only opaque encrypted message payloads."
   },
   "servers": [
     { "url": "http://localhost:8080" }
@@ -303,7 +378,10 @@ std::string BuildOpenApiSpec() {
                 "required": ["username", "password", "public_key", "encrypted_private_key"],
                 "properties": {
                   "username": { "type": "string" },
-                  "password": { "type": "string" },
+                  "password": {
+                    "type": "string",
+                    "description": "8-128 characters with at least one number and one special character."
+                  },
                   "public_key": { "type": "string" },
                   "encrypted_private_key": { "type": "string" }
                 }
@@ -362,6 +440,62 @@ std::string BuildOpenApiSpec() {
         }
       }
     },
+    "/api/contacts": {
+      "get": {
+        "summary": "List saved contacts for the current user",
+        "security": [ { "bearerAuth": [] } ],
+        "responses": {
+          "200": { "description": "Contacts list" },
+          "401": { "description": "Unauthorized" }
+        }
+      },
+      "post": {
+        "summary": "Save or update a contact",
+        "security": [ { "bearerAuth": [] } ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["username"],
+                "properties": {
+                  "username": { "type": "string" },
+                  "alias": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Contact saved" },
+          "401": { "description": "Unauthorized" },
+          "404": { "description": "User not found" }
+        }
+      }
+    },
+    "/api/contacts/{alias}": {
+      "delete": {
+        "summary": "Remove a saved contact by alias",
+        "security": [ { "bearerAuth": [] } ],
+        "responses": {
+          "200": { "description": "Contact removed" },
+          "401": { "description": "Unauthorized" },
+          "404": { "description": "Alias not found" }
+        }
+      }
+    },
+    "/api/admin/users": {
+      "get": {
+        "summary": "List all usernames (admin only)",
+        "security": [ { "bearerAuth": [] } ],
+        "responses": {
+          "200": { "description": "List of usernames" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Forbidden" }
+        }
+      }
+    },
     "/api/users/{username}/public-key": {
       "get": {
         "summary": "Get public key by username",
@@ -383,6 +517,7 @@ std::string BuildOpenApiSpec() {
     "/api/messages": {
       "post": {
         "summary": "Send message",
+        "description": "Stores an opaque encrypted payload. The ciphertext may decrypt to plain text or to a client-defined attachment envelope for small images/files.",
         "security": [ { "bearerAuth": [] } ],
         "requestBody": {
           "required": true,
@@ -408,6 +543,7 @@ std::string BuildOpenApiSpec() {
       },
       "get": {
         "summary": "List messages",
+        "description": "Returns opaque encrypted message payloads. Clients are responsible for decrypting text or attachment envelopes locally.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [
           { "name": "with", "in": "query", "schema": { "type": "string" } },
@@ -436,9 +572,13 @@ void EnsureSchema(pqxx::connection& conn) {
       password_hash TEXT NOT NULL,
       public_key TEXT NOT NULL,
       encrypted_private_key TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'user',
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     );
   )");
+
+  txn.exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';");
+  txn.exec("UPDATE users SET role = 'user' WHERE role IS NULL OR role = '';");
 
   txn.exec(R"(
     CREATE TABLE IF NOT EXISTS messages (
@@ -452,6 +592,17 @@ void EnsureSchema(pqxx::connection& conn) {
     );
   )");
 
+  txn.exec(R"(
+    CREATE TABLE IF NOT EXISTS contacts (
+      id SERIAL PRIMARY KEY,
+      owner_user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      alias TEXT NOT NULL,
+      contact_user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE(owner_user_id, alias)
+    );
+  )");
+
   txn.commit();
 }
 
@@ -459,7 +610,7 @@ void EnsureSchema(pqxx::connection& conn) {
 std::optional<DbUser> GetUserByUsername(pqxx::connection& conn, const std::string& username) {
   pqxx::work txn(conn);
   pqxx::result r = txn.exec_params(
-      "SELECT id, username, password_hash, public_key, encrypted_private_key FROM users WHERE username = $1",
+      "SELECT id, username, password_hash, public_key, encrypted_private_key, role FROM users WHERE username = $1",
       username);
   txn.commit();
   if (r.empty()) {
@@ -471,7 +622,30 @@ std::optional<DbUser> GetUserByUsername(pqxx::connection& conn, const std::strin
   user.password_hash = r[0][2].as<std::string>();
   user.public_key = r[0][3].as<std::string>();
   user.encrypted_private_key = r[0][4].as<std::string>();
+  user.role = r[0][5].as<std::string>(kUserRole);
   return user;
+}
+
+std::vector<DbContact> GetContactsForUser(pqxx::connection& conn, int owner_user_id) {
+  pqxx::work txn(conn);
+  pqxx::result rows = txn.exec_params(
+      "SELECT c.alias, u.username "
+      "FROM contacts c "
+      "JOIN users u ON c.contact_user_id = u.id "
+      "WHERE c.owner_user_id = $1 "
+      "ORDER BY c.alias ASC, u.username ASC",
+      owner_user_id);
+  txn.commit();
+
+  std::vector<DbContact> contacts;
+  contacts.reserve(rows.size());
+  for (const auto& row : rows) {
+    contacts.push_back(DbContact{
+        row[0].as<std::string>(),
+        row[1].as<std::string>(),
+    });
+  }
+  return contacts;
 }
 
 // Configure the server, routes, and start listening.
@@ -484,6 +658,7 @@ int main() {
   try {
     pqxx::connection conn(GetDbUrl());
     EnsureSchema(conn);
+    EnsureBootstrapAdminAccount(conn);
   } catch (const std::exception& ex) {
     std::fprintf(stderr, "Database init failed: %s\n", ex.what());
     return 1;
@@ -565,11 +740,17 @@ int main() {
       <li><code>POST /api/login</code></li>
       <li><code>POST /api/logout</code></li>
       <li><code>GET /api/me</code></li>
+      <li><code>GET /api/contacts</code></li>
+      <li><code>POST /api/contacts</code></li>
+      <li><code>DELETE /api/contacts/{alias}</code></li>
+      <li><code>GET /api/admin/users</code> (admin only)</li>
       <li><code>GET /api/users/{username}/public-key</code></li>
       <li><code>POST /api/messages</code></li>
       <li><code>GET /api/messages</code> (with, limit, order, before_id)</li>
     </ul>
     <p>Protected endpoints require <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+    <p>New registrations require a password with 8-128 characters, at least one number, and at least one special character.</p>
+    <p>Message payloads are opaque encrypted blobs and may contain client-defined attachment envelopes for small images/files.</p>
   </body>
 </html>
 )HTML";
@@ -597,7 +778,7 @@ int main() {
     }
 
     auto now = std::chrono::system_clock::now();
-    if (!register_ip_limiter.Allow(req.remote_addr, 10, std::chrono::seconds(60), now)) {
+    if (!register_ip_limiter.Allow(req.remote_addr, 30, std::chrono::seconds(60), now)) {
       res.status = 429;
       res.set_content("{\"error\":\"rate_limited\"}", "application/json");
       return;
@@ -629,7 +810,8 @@ int main() {
     }
     if (!IsValidPassword(password)) {
       res.status = 400;
-      res.set_content("{\"error\":\"invalid_password\",\"message\":\"password must be 8-128 characters\"}", "application/json");
+      json out = {{"error", "invalid_password"}, {"message", PasswordPolicyMessage()}};
+      res.set_content(out.dump(), "application/json");
       return;
     }
     if (!IsFieldLengthValid(public_key, kMaxPublicKeyLen) ||
@@ -668,11 +850,12 @@ int main() {
 
       pqxx::work txn(conn);
       txn.exec_params(
-          "INSERT INTO users (username, password_hash, public_key, encrypted_private_key) VALUES ($1, $2, $3, $4)",
+          "INSERT INTO users (username, password_hash, public_key, encrypted_private_key, role) VALUES ($1, $2, $3, $4, $5)",
           username,
           std::string(hash),
           public_key,
-          encrypted_private_key);
+          encrypted_private_key,
+          std::string(kUserRole));
       txn.commit();
 
       res.status = 201;
@@ -746,7 +929,7 @@ int main() {
         tokens[token] = TokenInfo{username, expires_at};
       }
 
-      json out = { {"token", token}, {"expires_in", 3600} };
+      json out = { {"token", token}, {"expires_in", 3600}, {"role", user->role} };
       res.set_content(out.dump(), "application/json");
     } catch (const std::exception& ex) {
       std::fprintf(stderr, "Login DB error: %s\n", ex.what());
@@ -818,11 +1001,222 @@ int main() {
       json out = {
           {"username", user->username},
           {"public_key", user->public_key},
-          {"encrypted_private_key", user->encrypted_private_key}
+          {"encrypted_private_key", user->encrypted_private_key},
+          {"role", user->role}
       };
       res.set_content(out.dump(), "application/json");
     } catch (const std::exception& ex) {
       std::fprintf(stderr, "Me DB error: %s\n", ex.what());
+      res.status = 500;
+      res.set_content("{\"error\":\"db_error\"}", "application/json");
+    }
+  });
+
+  server.Get("/api/contacts", [&](const httplib::Request& req, httplib::Response& res) {
+    if (!ApplyCors(req, res, cors)) {
+      res.status = 403;
+      res.set_content("{\"error\":\"cors_denied\"}", "application/json");
+      return;
+    }
+    auto auth_user = ValidateToken(req, tokens, token_mu, last_token_cleanup);
+    if (!auth_user.has_value()) {
+      res.status = 401;
+      res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+      return;
+    }
+
+    try {
+      pqxx::connection conn(GetDbUrl());
+      auto owner = GetUserByUsername(conn, *auth_user);
+      if (!owner.has_value()) {
+        res.status = 401;
+        res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+        return;
+      }
+
+      auto contacts = GetContactsForUser(conn, owner->id);
+      json out = json::array();
+      for (const auto& contact : contacts) {
+        out.push_back({
+            {"alias", contact.alias},
+            {"username", contact.username},
+        });
+      }
+      res.set_content(out.dump(), "application/json");
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr, "Contacts list DB error: %s\n", ex.what());
+      res.status = 500;
+      res.set_content("{\"error\":\"db_error\"}", "application/json");
+    }
+  });
+
+  server.Post("/api/contacts", [&](const httplib::Request& req, httplib::Response& res) {
+    if (!ApplyCors(req, res, cors)) {
+      res.status = 403;
+      res.set_content("{\"error\":\"cors_denied\"}", "application/json");
+      return;
+    }
+    if (!CheckBodySize(req, res)) {
+      return;
+    }
+    auto auth_user = ValidateToken(req, tokens, token_mu, last_token_cleanup);
+    if (!auth_user.has_value()) {
+      res.status = 401;
+      res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+      return;
+    }
+
+    json body;
+    try {
+      body = json::parse(req.body);
+    } catch (...) {
+      res.status = 400;
+      res.set_content("{\"error\":\"invalid_json\"}", "application/json");
+      return;
+    }
+
+    const std::string username = body.value("username", "");
+    const std::string alias = body.value("alias", username);
+    if (username.empty() || alias.empty()) {
+      res.status = 400;
+      res.set_content("{\"error\":\"missing_fields\"}", "application/json");
+      return;
+    }
+    if (!IsValidUsername(username) || !IsValidUsername(alias)) {
+      res.status = 400;
+      res.set_content("{\"error\":\"invalid_username\"}", "application/json");
+      return;
+    }
+
+    try {
+      pqxx::connection conn(GetDbUrl());
+      auto owner = GetUserByUsername(conn, *auth_user);
+      auto contact_user = GetUserByUsername(conn, username);
+      if (!owner.has_value()) {
+        res.status = 401;
+        res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+        return;
+      }
+      if (!contact_user.has_value()) {
+        res.status = 404;
+        res.set_content("{\"error\":\"user_not_found\"}", "application/json");
+        return;
+      }
+      if (owner->id == contact_user->id) {
+        res.status = 400;
+        res.set_content("{\"error\":\"invalid_contact\"}", "application/json");
+        return;
+      }
+
+      pqxx::work txn(conn);
+      txn.exec_params(
+          "INSERT INTO contacts (owner_user_id, alias, contact_user_id) "
+          "VALUES ($1, $2, $3) "
+          "ON CONFLICT (owner_user_id, alias) "
+          "DO UPDATE SET contact_user_id = EXCLUDED.contact_user_id",
+          owner->id,
+          alias,
+          contact_user->id);
+      txn.commit();
+
+      res.status = 201;
+      res.set_content("{\"status\":\"saved\"}", "application/json");
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr, "Contacts save DB error: %s\n", ex.what());
+      res.status = 500;
+      res.set_content("{\"error\":\"db_error\"}", "application/json");
+    }
+  });
+
+  server.Delete(R"(/api/contacts/(.*))", [&](const httplib::Request& req, httplib::Response& res) {
+    if (!ApplyCors(req, res, cors)) {
+      res.status = 403;
+      res.set_content("{\"error\":\"cors_denied\"}", "application/json");
+      return;
+    }
+    auto auth_user = ValidateToken(req, tokens, token_mu, last_token_cleanup);
+    if (!auth_user.has_value()) {
+      res.status = 401;
+      res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+      return;
+    }
+
+    const std::string alias = req.matches[1];
+    if (alias.empty() || !IsValidUsername(alias)) {
+      res.status = 400;
+      res.set_content("{\"error\":\"invalid_username\"}", "application/json");
+      return;
+    }
+
+    try {
+      pqxx::connection conn(GetDbUrl());
+      auto owner = GetUserByUsername(conn, *auth_user);
+      if (!owner.has_value()) {
+        res.status = 401;
+        res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+        return;
+      }
+
+      pqxx::work txn(conn);
+      pqxx::result deleted = txn.exec_params(
+          "DELETE FROM contacts WHERE owner_user_id = $1 AND alias = $2 RETURNING id",
+          owner->id,
+          alias);
+      txn.commit();
+
+      if (deleted.empty()) {
+        res.status = 404;
+        res.set_content("{\"error\":\"alias_not_found\"}", "application/json");
+        return;
+      }
+
+      res.set_content("{\"status\":\"removed\"}", "application/json");
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr, "Contacts delete DB error: %s\n", ex.what());
+      res.status = 500;
+      res.set_content("{\"error\":\"db_error\"}", "application/json");
+    }
+  });
+
+  server.Get("/api/admin/users", [&](const httplib::Request& req, httplib::Response& res) {
+    if (!ApplyCors(req, res, cors)) {
+      res.status = 403;
+      res.set_content("{\"error\":\"cors_denied\"}", "application/json");
+      return;
+    }
+    auto auth_user = ValidateToken(req, tokens, token_mu, last_token_cleanup);
+    if (!auth_user.has_value()) {
+      res.status = 401;
+      res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+      return;
+    }
+
+    try {
+      pqxx::connection conn(GetDbUrl());
+      auto requester = GetUserByUsername(conn, *auth_user);
+      if (!requester.has_value()) {
+        res.status = 401;
+        res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+        return;
+      }
+      if (!IsAdminRole(requester->role)) {
+        res.status = 403;
+        res.set_content("{\"error\":\"forbidden\"}", "application/json");
+        return;
+      }
+
+      pqxx::work txn(conn);
+      pqxx::result rows = txn.exec("SELECT username FROM users ORDER BY username ASC");
+      txn.commit();
+
+      json users = json::array();
+      for (const auto& row : rows) {
+        users.push_back({{"username", row[0].as<std::string>()}});
+      }
+      json out = {{"users", users}};
+      res.set_content(out.dump(), "application/json");
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr, "Admin users DB error: %s\n", ex.what());
       res.status = 500;
       res.set_content("{\"error\":\"db_error\"}", "application/json");
     }

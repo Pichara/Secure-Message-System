@@ -44,13 +44,19 @@ This starts PostgreSQL and the backend with the correct `DATABASE_URL`.
 - `GET /health`
 - `POST /api/register`
 - `POST /api/login`
+- `POST /api/logout`
 - `GET /api/me`
+- `GET /api/admin/users`
 - `GET /api/users/{username}/public-key`
 - `POST /api/messages`
 - `GET /api/messages?with={username}`
 
 ## Security Notes (OWASP)
 - Passwords are hashed with **Argon2id** via libsodium.
+- New registrations require passwords that are 8-128 characters long and include at least one number and one special character.
 - Queries are parameterized to prevent SQL injection.
 - Tokens are short-lived (1 hour) and stored in memory (demo).
 - E2EE message content is stored as ciphertext only.
+- Admin access uses the normal login flow. User records default to `role=user`, `/api/me` returns that role, and `/api/admin/users` is restricted to admin accounts.
+- Existing databases are migrated on startup to add the `role` column automatically.
+- Message storage remains opaque. The backend now accepts larger encrypted payloads so clients can send small attachment/image envelopes through the existing encrypted message pipeline.

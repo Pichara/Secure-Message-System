@@ -52,12 +52,13 @@ TUI hotkeys:
 ```powershell
 python secure_message_cli.py register alice
 ```
-Password must be 8-128 characters.
+Password must be 8-128 characters and include at least one number and one special character.
 
 ## Login
 ```powershell
 python secure_message_cli.py login alice
 ```
+The CLI reads `/api/me` after login and stores the returned role in local state. Existing users can still log in with their current passwords.
 
 ## Shell (menu)
 ```powershell
@@ -77,11 +78,21 @@ Send without saving plaintext locally:
 ```powershell
 python secure_message_cli.py send bob "hello" --no-history
 ```
+Send an encrypted image attachment:
+```powershell
+python secure_message_cli.py send bob --file .\photo.png --caption "latest mockup"
+```
+You can also use the positional message as the caption:
+```powershell
+python secure_message_cli.py send bob "latest mockup" --file .\photo.png
+```
+Supported image types: PNG, JPEG, GIF, and WebP. Attachment size is capped at 128 KiB on the CLI side.
 
 ## Read messages
 ```powershell
 python secure_message_cli.py read bob
 ```
+Image messages are shown as metadata in the conversation view, including message id, filename, mime type, size, and optional caption.
 
 ## Chat (thread view)
 ```powershell
@@ -93,13 +104,34 @@ python secure_message_cli.py chat bob
 python secure_message_cli.py inbox --with bob
 ```
 
+## Attachments
+Show attachment metadata for a decrypted or locally saved image message:
+```powershell
+python secure_message_cli.py attachments show 42
+```
+Save an image attachment to disk:
+```powershell
+python secure_message_cli.py attachments save 42 .\downloads
+python secure_message_cli.py attachments save 42 .\downloads\photo.png
+```
+Received attachments can always be decrypted from the server. Sent attachments can only be re-saved if local history storage was enabled when you sent them.
+
+## Admin
+List registered usernames for an admin session:
+```powershell
+python secure_message_cli.py admin users
+```
+`whoami` prints `username (admin)` for admin sessions.
+
 ## Contacts (aliases)
 ```powershell
 python secure_message_cli.py contacts add boss alice
 python secure_message_cli.py contacts list
 python secure_message_cli.py contacts remove boss
 ```
+Contacts are now stored on the backend per logged-in user, not in local machine state.
 
 ## Notes
 - Private keys are encrypted locally with a password-derived key.
 - Messages are encrypted end-to-end using X25519 + AES-GCM.
+- Image attachments are wrapped in an encrypted message envelope; the server still stores ciphertext only.

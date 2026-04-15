@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import base64
+import json
+import mimetypes
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 from textual.app import App, ComposeResult
@@ -33,6 +37,149 @@ from secure_message_cli import (
 class AuthState:
     token: str
     username: str
+    role: str = "user"
+
+
+MAX_IMAGE_BYTES = 128 * 1024
+PASSWORD_RULE_HINT = "Password must be 8-128 characters and include at least one number and one special character."
+ADMIN_USERNAME = "ADMIN"
+
+
+def _registration_password_message(password: str) -> Optional[str]:
+    """Mirror the stronger registration policy locally for immediate TUI feedback."""
+    if len(password) < 8 or len(password) > 128:
+        return PASSWORD_RULE_HINT
+    if not any(ch.isdigit() for ch in password):
+        return PASSWORD_RULE_HINT
+    if not any((not ch.isalnum()) and (not ch.isspace()) for ch in password):
+        return PASSWORD_RULE_HINT
+    return None
+
+
+def _detect_image_mime(data: bytes) -> Optional[str]:
+    """Recognize a small set of image formats without trusting file extensions."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _build_image_message(path_value: str, caption: str = "") -> str:
+    """Package a local image into a JSON envelope that can ride over the existing E2EE path."""
+    path = Path(path_value).expanduser()
+    if not path.is_file():
+        raise ValueError("Image file not found.")
+
+    raw = path.read_bytes()
+    if not raw:
+        raise ValueError("Image file is empty.")
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise ValueError(f"Image must be {MAX_IMAGE_BYTES // 1024} KiB or smaller.")
+
+    mime = _detect_image_mime(raw) or mimetypes.guess_type(path.name)[0]
+    if mime not in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
+        raise ValueError("Only PNG, JPEG, GIF, and WebP images are supported.")
+
+    payload = {
+        "kind": "image",
+        "caption": caption.strip(),
+        "attachment": {
+            "name": path.name,
+            "mime": mime,
+            "size_bytes": len(raw),
+            "bytes_b64": base64.b64encode(raw).decode("ascii"),
+        },
+    }
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def _parse_image_message(plaintext: str) -> Optional[dict]:
+    """Best-effort parse of the attachment envelope while remaining compatible with legacy text."""
+    try:
+        payload = json.loads(plaintext)
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("kind") != "image":
+        return None
+    attachment = payload.get("attachment")
+    if not isinstance(attachment, dict):
+        return None
+    if not attachment.get("name") or not attachment.get("mime"):
+        return None
+    return payload
+
+
+def _format_plaintext(plaintext: str) -> str:
+    """Render text messages normally and image envelopes as compact metadata."""
+    attachment = _parse_image_message(plaintext)
+    if not attachment:
+        return plaintext
+
+    meta = attachment["attachment"]
+    size_bytes = meta.get("size_bytes")
+    if not isinstance(size_bytes, int):
+        data_b64 = meta.get("bytes_b64") or meta.get("bytes_base64") or ""
+        try:
+            size_bytes = len(base64.b64decode(data_b64))
+        except Exception:
+            size_bytes = 0
+    size_label = f"{size_bytes} bytes" if size_bytes else "size unknown"
+    caption = str(attachment.get("caption") or "").strip()
+    summary = f"[image] {meta.get('name')} ({meta.get('mime')}, {size_label})"
+    if caption:
+        summary = f"{summary} caption={caption}"
+    return summary
+
+
+class UserListScreen(ModalScreen[None]):
+    """Read-only modal for the admin-only user list."""
+
+    CSS = """
+    #user-list-dialog {
+        width: 70%;
+        min-width: 40;
+        height: auto;
+        max-height: 80%;
+        padding: 1 2;
+        border: round #4c4c4c;
+    }
+    #user-list-log {
+        height: 16;
+        border: round #4c4c4c;
+        margin: 1 0;
+    }
+    #user-list-actions {
+        height: auto;
+    }
+    """
+
+    def __init__(self, usernames: list[str]) -> None:
+        super().__init__()
+        self._usernames = usernames
+
+    def compose(self) -> ComposeResult:
+        with Container(id="user-list-dialog"):
+            yield Static("Registered Users", id="user-list-title")
+            yield RichLog(id="user-list-log", wrap=True)
+            with Horizontal(id="user-list-actions"):
+                yield Button("Close", id="close", variant="primary")
+
+    def on_mount(self) -> None:
+        log = self.query_one("#user-list-log", RichLog)
+        if not self._usernames:
+            log.write("No users returned.")
+            return
+        for username in self._usernames:
+            log.write(username)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "close":
+            self.dismiss(None)
 
 
 class InputDialog(ModalScreen[str]):
@@ -139,22 +286,28 @@ class AuthScreen(Screen):
             return None
 
         me = me_resp.json()
+        role = me.get("role") or "user"
         state["auth"] = {
             "token": token,
             "username": username,
             "expires_at": expires_at.isoformat(),
+            "role": role,
         }
         state["keys"] = {
             "public_key": me["public_key"],
             "encrypted_private_key": me["encrypted_private_key"],
         }
         _save_state(state)
-        return AuthState(token=token, username=username)
+        return AuthState(token=token, username=username, role=role)
 
     def _register(self, username: str, password: str, confirm: str) -> bool:
         """Register a user by generating a keypair and uploading only public + encrypted private key."""
         if password != confirm:
             self._set_status("Password confirmation does not match.")
+            return False
+        password_message = _registration_password_message(password)
+        if password_message:
+            self._set_status(password_message)
             return False
         state = _state()
         private_key, public_key = _generate_keypair()
@@ -172,7 +325,7 @@ class AuthScreen(Screen):
             try:
                 data = resp.json()
                 if data.get("error") == "invalid_password":
-                    message = data.get("message") or "Password must be 8-128 characters."
+                    message = data.get("message") or PASSWORD_RULE_HINT
                 elif data.get("error") == "registration_failed":
                     message = "Registration failed."
             except Exception:
@@ -217,6 +370,7 @@ class MessageScreen(Screen):
         ("n", "new_chat", "New chat"),
         ("r", "refresh", "Refresh"),
         ("u", "unlock", "Unlock inbox"),
+        ("i", "attach_image", "Attach image"),
         ("l", "logout", "Logout"),
     ]
 
@@ -238,13 +392,24 @@ class MessageScreen(Screen):
         height: 3;
         margin-bottom: 1;
     }
+    #session-meta {
+        margin-bottom: 1;
+        color: #b0b0b0;
+    }
     #messages {
         width: 70%;
         border: round #4c4c4c;
     }
+    #compose-box {
+        height: auto;
+        margin-top: 1;
+    }
     #compose {
         height: 3;
         border: round #4c4c4c;
+    }
+    #compose-actions {
+        height: 3;
         margin-top: 1;
     }
     #status {
@@ -261,42 +426,94 @@ class MessageScreen(Screen):
         self.private_key = None
         self.current_with: Optional[str] = None
 
+    def _can_view_admin_users(self) -> bool:
+        """Only the dedicated ADMIN account should see the admin user list affordance."""
+        return self.auth.role == "admin" and self.auth.username == ADMIN_USERNAME
+
     def compose(self) -> ComposeResult:
         """Render sidebar contact list, message log, and compose box."""
         yield Header()
         with Horizontal(id="main"):
             with Container(id="sidebar"):
                 yield Static("Contacts", id="sidebar-title")
+                yield Static("", id="session-meta")
+                with Horizontal(id="contact-actions"):
+                    yield Button("New chat", id="new-chat", variant="primary")
+                    yield Button("Refresh", id="refresh")
+                    yield Button("Unlock", id="unlock")
+                    if self._can_view_admin_users():
+                        yield Button("Users", id="admin-users")
                 yield ListView(id="contact-list")
                 yield Static("No contact selected.", id="details")
             with Vertical(id="messages"):
                 yield RichLog(id="message-log", wrap=True)
-                yield Input(placeholder="Type message and press Enter", id="compose")
+                with Container(id="compose-box"):
+                    yield Input(placeholder="Type message and press Enter", id="compose")
+                    with Horizontal(id="compose-actions"):
+                        yield Button("Attach image", id="attach-image")
+                        yield Button("Logout", id="logout")
         yield Static("", id="status")
         yield Footer()
 
     def on_mount(self) -> None:
         """Disable compose until a conversation is loaded; then render contacts."""
         self.query_one("#compose", Input).disabled = True
+        self._update_session_meta()
         self._refresh_contacts()
 
     def _set_status(self, message: str) -> None:
         """Update the transient status line at the bottom of the screen."""
         self.query_one("#status", Static).update(message)
 
+    def _update_session_meta(self) -> None:
+        """Show the active user and role near the contact list."""
+        role_label = "admin" if self.auth.role == "admin" else "user"
+        self.query_one("#session-meta", Static).update(f"Signed in as {self.auth.username} ({role_label})")
+
+    def _load_contacts(self) -> list[dict[str, str]]:
+        """Fetch the current user's saved contacts from the backend."""
+        state = _state()
+        auth = state.get("auth") or {}
+        resp = _request(
+            "GET",
+            f"{_backend_url(state)}/api/contacts",
+            token=auth.get("token"),
+        )
+        if resp.status_code == 401:
+            self._set_status("Session expired. Please login again.")
+            self.app.push_screen(AuthScreen())
+            return []
+        if resp.status_code != 200:
+            self._set_status(f"Failed to load contacts: {resp.text}")
+            return []
+
+        payload = resp.json()
+        contacts: list[dict[str, str]] = []
+        if isinstance(payload, list):
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                alias = str(item.get("alias") or "").strip()
+                username = str(item.get("username") or "").strip()
+                if alias and username:
+                    contacts.append({"alias": alias, "username": username})
+        return contacts
+
     def _refresh_contacts(self) -> None:
-        """Re-render the sidebar contact list from local state (no backend call)."""
+        """Re-render the sidebar contact list from the backend."""
         state = _state()
         auth = state.get("auth") or {}
         if not _auth_valid(auth):
             self.app.push_screen(AuthScreen())
             return
 
-        contacts = state.get("contacts") or {}
+        contacts = self._load_contacts()
         list_view = self.query_one("#contact-list", ListView)
         list_view.clear()
 
-        for alias, username in sorted(contacts.items()):
+        for contact in contacts:
+            alias = contact["alias"]
+            username = contact["username"]
             label = f"{alias} ({username})" if alias != username else username
             item = ListItem(Static(label))
             item.user = username
@@ -356,7 +573,7 @@ class MessageScreen(Screen):
             else:
                 # Sent-message plaintext is only stored locally (optional); server stores ciphertext only.
                 plaintext = history.get(str(msg.get("id")), "[sent message not stored locally]")
-            log.write(f"{created_at} {sender} -> {recipient}: {plaintext}")
+            log.write(f"{created_at} {sender} -> {recipient}: {_format_plaintext(plaintext)}")
 
         self.query_one("#compose", Input).disabled = False
         self.query_one("#compose", Input).focus()
@@ -374,8 +591,8 @@ class MessageScreen(Screen):
     def _render_contact_details(self, with_user: str, messages: list[dict]) -> None:
         """Populate the details pane (aliases, counts, last message timestamp, key preview)."""
         state = _state()
-        contacts = state.get("contacts") or {}
-        aliases = [alias for alias, username in contacts.items() if username == with_user]
+        contacts = self._load_contacts()
+        aliases = [item["alias"] for item in contacts if item["username"] == with_user]
         alias_line = ", ".join(aliases) if aliases else "-"
 
         last_msg = messages[-1] if messages else {}
@@ -423,52 +640,8 @@ class MessageScreen(Screen):
         if not self.current_with:
             self._set_status("Select a conversation first.")
             return
-
-        state = _state()
-        auth = state.get("auth") or {}
-        recipient = _resolve_alias(state, self.current_with)
-
-        # We encrypt to the recipient's public key (E2EE); the server only ever receives ciphertext.
-        pub_resp = _request(
-            "GET",
-            f"{_backend_url(state)}/api/users/{recipient}/public-key",
-            token=auth.get("token"),
-        )
-        if pub_resp.status_code != 200:
-            self._set_status(f"Failed to fetch public key: {pub_resp.text}")
-            return
-
-        recipient_public_key = pub_resp.json()["public_key"]
-        encrypted_key, ciphertext, iv = _encrypt_message(message, recipient_public_key)
-        payload = {
-            "recipient": recipient,
-            "encrypted_key": encrypted_key,
-            "ciphertext": ciphertext,
-            "iv": iv,
-        }
-        post_resp = _request(
-            "POST",
-            f"{_backend_url(state)}/api/messages",
-            token=auth.get("token"),
-            json=payload,
-        )
-        if post_resp.status_code != 201:
-            self._set_status(f"Send failed: {post_resp.text}")
-            return
-
-        save_history = state.get("save_history", True)
-        # Store sent plaintext locally (optional) so the UI can display outbound messages without decrypting.
-        _append_history(
-            {
-                "id": post_resp.json().get("id"),
-                "sender": auth.get("username"),
-                "recipient": recipient,
-                "plaintext": message,
-            },
-            save_history=save_history,
-        )
-        event.input.value = ""
-        self._render_conversation(self.current_with)
+        if self._send_payload(message):
+            event.input.value = ""
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle on-screen buttons (keyboard shortcuts are handled by Textual actions)."""
@@ -477,6 +650,18 @@ class MessageScreen(Screen):
             return
         if event.button.id == "refresh":
             self.action_refresh()
+            return
+        if event.button.id == "unlock":
+            await self.action_unlock()
+            return
+        if event.button.id == "attach-image":
+            await self.action_attach_image()
+            return
+        if event.button.id == "admin-users":
+            await self.action_admin_users()
+            return
+        if event.button.id == "logout":
+            self.action_logout()
             return
 
     @work(exclusive=True)
@@ -507,14 +692,16 @@ class MessageScreen(Screen):
                 self._set_status(f"Failed to resolve user: {resp.text}")
                 return
 
-            contacts = state.get("contacts") or {}
-            if username not in contacts.values() and username not in contacts.keys():
-                contacts[username] = username
-                state["contacts"] = contacts
-                _save_state(state)
-                self._set_status(f"Added {username} to contacts.")
-            else:
-                self._set_status(f"{username} is already in contacts.")
+            save_resp = _request(
+                "POST",
+                f"{_backend_url(state)}/api/contacts",
+                token=auth.get("token"),
+                json={"alias": username, "username": username},
+            )
+            if save_resp.status_code != 201:
+                self._set_status(f"Failed to save contact: {save_resp.text}")
+                return
+            self._set_status(f"Added {username} to contacts.")
             self._refresh_contacts()
 
             list_view = self.query_one("#contact-list", ListView)
@@ -552,12 +739,126 @@ class MessageScreen(Screen):
         except Exception:
             self._set_status("Failed to decrypt private key.")
 
+    @work(exclusive=True)
+    async def action_attach_image(self) -> None:
+        """Prompt for an image path and optional caption, then send it as an encrypted attachment envelope."""
+        if not self.current_with:
+            self._set_status("Select a conversation before attaching an image.")
+            return
+
+        path_value = await self.app.push_screen(
+            InputDialog("Attach image", "C:\\path\\to\\image.png"),
+            wait_for_dismiss=True,
+        )
+        if not path_value:
+            return
+
+        caption = await self.app.push_screen(
+            InputDialog("Optional caption", "caption"),
+            wait_for_dismiss=True,
+        )
+
+        try:
+            message = _build_image_message(path_value, caption or "")
+        except ValueError as exc:
+            self._set_status(str(exc))
+            return
+        self._send_payload(message)
+
+    @work(exclusive=True)
+    async def action_admin_users(self) -> None:
+        """Fetch and display the server-side user list for admin sessions."""
+        if not self._can_view_admin_users():
+            self._set_status("Admin access required.")
+            return
+
+        state = _state()
+        auth = state.get("auth") or {}
+        resp = _request(
+            "GET",
+            f"{_backend_url(state)}/api/admin/users",
+            token=auth.get("token"),
+        )
+        if resp.status_code == 401:
+            self._set_status("Session expired. Please login again.")
+            self.app.push_screen(AuthScreen())
+            return
+        if resp.status_code == 403:
+            self._set_status("Admin access denied by server.")
+            return
+        if resp.status_code != 200:
+            self._set_status(f"Failed to load users: {resp.text}")
+            return
+
+        payload = resp.json()
+        raw_users = payload.get("users", payload)
+        usernames: list[str] = []
+        if isinstance(raw_users, list):
+            for entry in raw_users:
+                if isinstance(entry, dict) and entry.get("username"):
+                    usernames.append(str(entry["username"]))
+                elif isinstance(entry, str):
+                    usernames.append(entry)
+
+        self._set_status(f"Loaded {len(usernames)} users.")
+        await self.app.push_screen(UserListScreen(usernames), wait_for_dismiss=True)
+
     def action_logout(self) -> None:
         """Clear local auth state and return to the login screen."""
         state = _state()
         state["auth"] = {}
         _save_state(state)
         self.app.push_screen(AuthScreen())
+
+    def _send_payload(self, message: str) -> bool:
+        """Encrypt and send a text or attachment payload using the existing message API."""
+        if not self.current_with:
+            self._set_status("Select a conversation first.")
+            return False
+
+        state = _state()
+        auth = state.get("auth") or {}
+        recipient = _resolve_alias(state, self.current_with)
+
+        pub_resp = _request(
+            "GET",
+            f"{_backend_url(state)}/api/users/{recipient}/public-key",
+            token=auth.get("token"),
+        )
+        if pub_resp.status_code != 200:
+            self._set_status(f"Failed to fetch public key: {pub_resp.text}")
+            return False
+
+        recipient_public_key = pub_resp.json()["public_key"]
+        encrypted_key, ciphertext, iv = _encrypt_message(message, recipient_public_key)
+        payload = {
+            "recipient": recipient,
+            "encrypted_key": encrypted_key,
+            "ciphertext": ciphertext,
+            "iv": iv,
+        }
+        post_resp = _request(
+            "POST",
+            f"{_backend_url(state)}/api/messages",
+            token=auth.get("token"),
+            json=payload,
+        )
+        if post_resp.status_code != 201:
+            self._set_status(f"Send failed: {post_resp.text}")
+            return False
+
+        _append_history(
+            {
+                "id": post_resp.json().get("id"),
+                "sender": auth.get("username"),
+                "recipient": recipient,
+                "plaintext": message,
+            },
+            save_history=state.get("save_history", True),
+        )
+        self._set_status(f"Sent message to {recipient}.")
+        self._render_conversation(self.current_with)
+        return True
 
 
 class SecureMessageTUI(App):
@@ -571,13 +872,8 @@ class SecureMessageTUI(App):
     """
 
     def on_mount(self) -> None:
-        """Boot into the message view if an existing token is still valid; otherwise show auth."""
-        state = _state()
-        auth = state.get("auth") or {}
-        if _auth_valid(auth):
-            self.push_screen(MessageScreen(AuthState(token=auth["token"], username=auth["username"])))
-        else:
-            self.push_screen(AuthScreen())
+        """Always start on the login screen rather than restoring a previous session."""
+        self.push_screen(AuthScreen())
 
 
 def run_tui() -> None:

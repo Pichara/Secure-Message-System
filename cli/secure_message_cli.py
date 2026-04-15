@@ -2,12 +2,13 @@ import base64
 import copy
 import inspect
 import json
+import mimetypes
 import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 import typer
@@ -27,6 +28,10 @@ config_app = typer.Typer(no_args_is_help=True)
 app.add_typer(config_app, name="config")
 contacts_app = typer.Typer(no_args_is_help=True)
 app.add_typer(contacts_app, name="contacts")
+admin_app = typer.Typer(no_args_is_help=True)
+app.add_typer(admin_app, name="admin")
+attachments_app = typer.Typer(no_args_is_help=True)
+app.add_typer(attachments_app, name="attachments")
 
 console = Console(force_terminal=False)
 
@@ -36,6 +41,11 @@ HISTORY_FILE = STATE_DIR / "history.jsonl"
 
 DEFAULT_BACKEND_URL = "http://localhost:8080"
 PBKDF2_ITERATIONS = 200_000
+MAX_ATTACHMENT_BYTES = 128 * 1024
+PASSWORD_POLICY_MESSAGE = (
+    "Password must be 8-128 characters and include at least one number "
+    "and one special character."
+)
 
 # Typer 0.12.x calls Click's make_metavar() without ctx, but Click 8.3+ requires ctx.
 # This patch keeps help output working across Click versions.
@@ -69,14 +79,18 @@ def _state() -> dict:
             "backend_url": DEFAULT_BACKEND_URL,
             "auth": {},
             "keys": {},
-            "contacts": {},
             "save_history": True,
         }
-    return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    if "contacts" in state:
+        state.pop("contacts", None)
+        STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    return state
 
 
 # Persist state to disk with best-effort permissions.
 def _save_state(state: dict) -> None:
+    state.pop("contacts", None)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
     if os.name != "nt":
@@ -88,14 +102,14 @@ def _backend_url(state: dict) -> str:
     return state.get("backend_url") or DEFAULT_BACKEND_URL
 
 
-# Convenience accessor for contact aliases.
-def _contacts(state: dict) -> dict:
-    return state.get("contacts") or {}
-
-
-# Map an alias to its username, or return the input.
 def _resolve_alias(state: dict, name: str) -> str:
-    contacts = _contacts(state)
+    auth = state.get("auth") or {}
+    if not _auth_valid(auth):
+        return name
+    try:
+        contacts = _contact_map(state, auth)
+    except Exception:
+        return name
     return contacts.get(name, name)
 
 
@@ -120,6 +134,16 @@ def _masked_state(state: dict) -> dict:
         keys["encrypted_private_key"] = _mask_secret(keys["encrypted_private_key"])
     masked["keys"] = keys
     return masked
+
+
+def _password_policy_error(password: str) -> Optional[str]:
+    if len(password) < 8 or len(password) > 128:
+        return PASSWORD_POLICY_MESSAGE
+    if not any(char.isdigit() for char in password):
+        return PASSWORD_POLICY_MESSAGE
+    if not any((not char.isalnum()) and (not char.isspace()) for char in password):
+        return PASSWORD_POLICY_MESSAGE
+    return None
 
 
 # Ensure an auth token is present for protected actions.
@@ -156,6 +180,11 @@ def _auth_valid(auth: dict) -> bool:
     if expires_at and datetime.now(timezone.utc) >= expires_at:
         return False
     return True
+
+
+def _auth_role(auth: dict) -> str:
+    role = str(auth.get("role") or "user").strip().lower()
+    return role or "user"
 
 
 # Derive a symmetric key from password + salt using PBKDF2.
@@ -283,6 +312,249 @@ def _decrypt_message(ciphertext_b64: str, iv_b64: str, encrypted_key_payload: st
     aes = AESGCM(key)
     plaintext = aes.decrypt(_b64decode(iv_b64), _b64decode(ciphertext_b64), None)
     return plaintext.decode("utf-8")
+
+
+def _safe_filename(name: str, fallback: str = "attachment.bin") -> str:
+    candidate = Path(name or fallback).name.strip()
+    if not candidate:
+        return fallback
+    cleaned = "".join(char for char in candidate if char.isalnum() or char in {"-", "_", ".", " "}).strip()
+    return cleaned or fallback
+
+
+def _detect_image_type(data: bytes) -> Optional[tuple[str, str]]:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", ".jpg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif", ".gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+    return None
+
+
+def _build_image_envelope(file_path: Path, caption: Optional[str]) -> tuple[str, dict[str, Any]]:
+    raw_bytes = file_path.read_bytes()
+    if not raw_bytes:
+        raise ValueError("Image file is empty.")
+    if len(raw_bytes) > MAX_ATTACHMENT_BYTES:
+        raise ValueError(f"Image exceeds {MAX_ATTACHMENT_BYTES} bytes.")
+
+    detected = _detect_image_type(raw_bytes)
+    if detected is None:
+        raise ValueError("Unsupported image type. Use PNG, JPEG, GIF, or WebP.")
+    mime, fallback_suffix = detected
+
+    file_name = _safe_filename(file_path.name or f"image{fallback_suffix}", fallback=f"image{fallback_suffix}")
+    if not Path(file_name).suffix:
+        guessed_ext = mimetypes.guess_extension(mime) or fallback_suffix
+        file_name = f"{file_name}{guessed_ext}"
+
+    envelope = {
+        "kind": "image",
+        "caption": (caption or "").strip(),
+        "attachment": {
+            "name": file_name,
+            "mime": mime,
+            "size_bytes": len(raw_bytes),
+            "bytes_b64": _b64encode(raw_bytes),
+        },
+    }
+    metadata = {
+        "name": file_name,
+        "mime": mime,
+        "size_bytes": len(raw_bytes),
+        "caption": envelope["caption"],
+    }
+    return json.dumps(envelope), metadata
+
+
+def _message_content(raw_content: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw_content)
+    except json.JSONDecodeError:
+        return {"kind": "text", "raw": raw_content, "display": raw_content}
+
+    if not isinstance(payload, dict) or payload.get("kind") != "image":
+        return {"kind": "text", "raw": raw_content, "display": raw_content}
+
+    attachment = payload.get("attachment")
+    if not isinstance(attachment, dict):
+        return {"kind": "text", "raw": raw_content, "display": raw_content}
+
+    name = _safe_filename(str(attachment.get("name") or "image.bin"))
+    mime = str(attachment.get("mime") or "application/octet-stream")
+    size_bytes = attachment.get("size_bytes")
+    caption = str(payload.get("caption") or "").strip()
+    bytes_b64 = attachment.get("bytes_b64")
+
+    if not isinstance(size_bytes, int):
+        try:
+            size_bytes = len(_b64decode(str(bytes_b64)))
+        except Exception:
+            size_bytes = 0
+
+    display = f"[image] {name} ({mime}, {size_bytes} bytes)"
+    if caption:
+        display = f"{display} caption={caption}"
+
+    return {
+        "kind": "image",
+        "raw": raw_content,
+        "display": display,
+        "name": name,
+        "mime": mime,
+        "size_bytes": size_bytes,
+        "caption": caption,
+        "bytes_b64": bytes_b64,
+    }
+
+
+def _history_entry_from_record(entry: dict) -> Optional[dict[str, Any]]:
+    if "id" not in entry:
+        return None
+    raw_content = entry.get("content")
+    if raw_content is None and "plaintext" in entry:
+        raw_content = entry["plaintext"]
+    if raw_content is None:
+        return None
+    parsed = _message_content(str(raw_content))
+    parsed["raw"] = str(raw_content)
+    return parsed
+
+
+def _history_display(history: dict, message_id: Any) -> str:
+    entry = history.get(str(message_id))
+    if not entry:
+        return "[sent message not stored locally]"
+    return str(entry.get("display") or "[sent message not stored locally]")
+
+
+def _refresh_me_profile(state: dict, auth: dict) -> dict:
+    me_url = f"{_backend_url(state)}/api/me"
+    me_resp = _request("GET", me_url, token=auth["token"])
+    if me_resp.status_code != 200:
+        typer.secho(f"Failed to fetch /api/me: {me_resp.text}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    me = me_resp.json()
+    auth["username"] = me.get("username") or auth.get("username")
+    auth["role"] = str(me.get("role") or auth.get("role") or "user")
+    state["auth"] = auth
+    keys = state.get("keys") or {}
+    if me.get("public_key"):
+        keys["public_key"] = me["public_key"]
+    if me.get("encrypted_private_key"):
+        keys["encrypted_private_key"] = me["encrypted_private_key"]
+    state["keys"] = keys
+    _save_state(state)
+    return me
+
+
+def _fetch_contacts(state: dict, auth: dict) -> list[dict[str, str]]:
+    resp = _request("GET", f"{_backend_url(state)}/api/contacts", token=auth["token"])
+    if resp.status_code != 200:
+        typer.secho(f"Failed to fetch contacts: {resp.text}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    payload = resp.json()
+    contacts: list[dict[str, str]] = []
+    if isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            alias = str(item.get("alias") or "").strip()
+            username = str(item.get("username") or "").strip()
+            if alias and username:
+                contacts.append({"alias": alias, "username": username})
+    return contacts
+
+
+def _contact_map(state: dict, auth: dict) -> dict[str, str]:
+    return {item["alias"]: item["username"] for item in _fetch_contacts(state, auth)}
+
+
+def _resolve_admin_usernames(payload: Any) -> list[str]:
+    users = payload.get("users") if isinstance(payload, dict) else payload
+    if not isinstance(users, list):
+        return []
+    usernames: list[str] = []
+    for item in users:
+        if isinstance(item, str):
+            username = item
+        elif isinstance(item, dict):
+            username = item.get("username")
+        else:
+            username = None
+        if username:
+            usernames.append(str(username))
+    return usernames
+
+
+def _message_content_for_id(
+    state: dict,
+    auth: dict,
+    message_id: int,
+    password: Optional[str] = None,
+) -> tuple[dict[str, Any], str]:
+    history = _load_history()
+    history_entry = history.get(str(message_id))
+    if history_entry:
+        return history_entry, "local history"
+
+    url = f"{_backend_url(state)}/api/messages"
+    resp = _request("GET", url, token=auth["token"])
+    if resp.status_code != 200:
+        typer.secho(f"Failed to fetch messages: {resp.text}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    target = next((msg for msg in resp.json() if int(msg.get("id", -1)) == message_id), None)
+    if target is None:
+        typer.secho("Message not found.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    if target.get("recipient") != auth.get("username"):
+        typer.secho(
+            "Only received attachments can be decrypted from the server. "
+            "Use local history for sent attachments.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(1)
+
+    if not password:
+        password = typer.prompt("Password", hide_input=True)
+    try:
+        private_key = _load_private_key_from_state(state, password)
+    except Exception:
+        typer.secho("Failed to decrypt private key.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    try:
+        plaintext = _decrypt_message(
+            target.get("ciphertext", ""),
+            target.get("iv", ""),
+            target.get("encrypted_key", ""),
+            private_key,
+        )
+    except Exception:
+        typer.secho("Failed to decrypt message.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    return _message_content(plaintext), "server"
+
+
+def _write_attachment_file(output_path: Path, name: str, raw_bytes: bytes) -> Path:
+    target = output_path
+    if output_path.exists() and output_path.is_dir():
+        target = output_path / name
+    elif output_path.suffix == "" and str(output_path).endswith((os.sep, "/")):
+        target = output_path / name
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(raw_bytes)
+    if os.name != "nt":
+        target.chmod(0o600)
+    return target
 
 
 # Wrapper for backend HTTP requests with consistent headers/timeouts.
@@ -487,7 +759,7 @@ def _display_conversation(
 
     convo.sort(key=lambda msg: msg.get("created_at", ""))
     rows = _conversation_rows(convo, username, private_key, history)
-    _render_table(f"Conversation with {with_user}", ["Time", "From", "To", "Message"], rows)
+    _render_table(f"Conversation with {with_user}", ["Id", "Time", "From", "To", "Message"], rows)
 
 
 # Produce table rows for a conversation, showing decrypted text when available.
@@ -499,6 +771,7 @@ def _conversation_rows(
 ) -> list[list[str]]:
     rows = []
     for msg in convo:
+        msg_id = str(msg.get("id", "?"))
         sender = msg.get("sender", "unknown")
         recipient = msg.get("recipient", "unknown")
         created_at = msg.get("created_at", "unknown")
@@ -514,12 +787,13 @@ def _conversation_rows(
                         msg.get("encrypted_key", ""),
                         private_key,
                     )
+                    plaintext = _message_content(plaintext)["display"]
                 except Exception:
                     plaintext = "[decryption failed]"
         else:
             # Sent-message plaintext is stored locally only (server never sees it).
-            plaintext = history.get(str(msg.get("id")), "[sent message not stored locally]")
-        rows.append([created_at, sender, recipient, plaintext])
+            plaintext = _history_display(history, msg.get("id"))
+        rows.append([msg_id, created_at, sender, recipient, plaintext])
     return rows
 
 
@@ -579,26 +853,92 @@ def config_set_history(value: str):
     typer.echo(f"History saving set to {status}.")
 
 
+@admin_app.command("users")
+def admin_users():
+    state = _state()
+    auth = _require_auth(state)
+    _refresh_me_profile(state, auth)
+    auth = state["auth"]
+    if _auth_role(auth) != "admin":
+        typer.secho("Admin access required.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    url = f"{_backend_url(state)}/api/admin/users"
+    resp = _request("GET", url, token=auth["token"])
+    if resp.status_code != 200:
+        typer.secho(f"Admin user list failed: {resp.text}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    usernames = _resolve_admin_usernames(resp.json())
+    if not usernames:
+        console.print("No users found.")
+        return
+    rows = [[name] for name in sorted(usernames)]
+    _render_table("Registered Users", ["Username"], rows)
+
+
+@attachments_app.command("show")
+def attachments_show(message_id: int):
+    state = _state()
+    auth = _require_auth(state)
+    content, source = _message_content_for_id(state, auth, message_id)
+    if content.get("kind") != "image":
+        typer.secho("Message is not an image attachment.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    rows = [
+        ["Message Id", str(message_id)],
+        ["Source", source],
+        ["Name", str(content.get("name") or "")],
+        ["Mime", str(content.get("mime") or "")],
+        ["Size", f"{content.get('size_bytes', 0)} bytes"],
+        ["Caption", str(content.get("caption") or "-")],
+    ]
+    _render_table("Attachment Details", ["Field", "Value"], rows)
+
+
+@attachments_app.command("save")
+def attachments_save(message_id: int, output_path: Path):
+    state = _state()
+    auth = _require_auth(state)
+    content, source = _message_content_for_id(state, auth, message_id)
+    if content.get("kind") != "image":
+        typer.secho("Message is not an image attachment.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    try:
+        raw_bytes = _b64decode(str(content.get("bytes_b64") or ""))
+    except Exception:
+        typer.secho("Attachment payload is invalid.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    saved_path = _write_attachment_file(output_path, str(content.get("name") or "attachment.bin"), raw_bytes)
+    typer.echo(f"Saved attachment from {source} to {saved_path}")
+
+
 # Add or update a contact alias.
 @contacts_app.command("add")
 def contacts_add(alias: str, username: str):
     state = _state()
-    contacts = _contacts(state)
-    contacts[alias] = username
-    state["contacts"] = contacts
-    _save_state(state)
-    console.print(f"Saved contact {alias} -> {username}")
+    auth = _require_auth(state)
+    payload = {"alias": alias.strip(), "username": username.strip()}
+    resp = _request("POST", f"{_backend_url(state)}/api/contacts", token=auth["token"], json=payload)
+    if resp.status_code != 201:
+        typer.secho(f"Failed to save contact: {resp.text}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    console.print(f"Saved contact {payload['alias']} -> {payload['username']}")
 
 
 # List saved contact aliases.
 @contacts_app.command("list")
 def contacts_list():
     state = _state()
-    contacts = _contacts(state)
+    auth = _require_auth(state)
+    contacts = _fetch_contacts(state, auth)
     if not contacts:
         console.print("No contacts saved.")
         return
-    rows = [[alias, username] for alias, username in sorted(contacts.items())]
+    rows = [[item["alias"], item["username"]] for item in contacts]
     _render_table("Contacts", ["Alias", "Username"], rows)
 
 
@@ -606,13 +946,18 @@ def contacts_list():
 @contacts_app.command("remove")
 def contacts_remove(alias: str):
     state = _state()
-    contacts = _contacts(state)
-    if alias not in contacts:
+    auth = _require_auth(state)
+    resp = _request(
+        "DELETE",
+        f"{_backend_url(state)}/api/contacts/{alias.strip()}",
+        token=auth["token"],
+    )
+    if resp.status_code == 404:
         typer.secho("Alias not found.", fg=typer.colors.RED)
         raise typer.Exit(1)
-    contacts.pop(alias, None)
-    state["contacts"] = contacts
-    _save_state(state)
+    if resp.status_code != 200:
+        typer.secho(f"Failed to remove contact: {resp.text}", fg=typer.colors.RED)
+        raise typer.Exit(1)
     console.print(f"Removed contact {alias}.")
 
 
@@ -694,6 +1039,10 @@ def launcher():
 def register(username: str):
     state = _state()
     password = typer.prompt("Password", hide_input=True, confirmation_prompt=True)
+    password_error = _password_policy_error(password)
+    if password_error:
+        typer.secho(f"Register failed: {password_error}", fg=typer.colors.RED)
+        raise typer.Exit(1)
 
     private_key, public_key = _generate_keypair()
     public_key_b64 = _serialize_public_key(public_key)
@@ -713,7 +1062,7 @@ def register(username: str):
         try:
             payload = resp.json()
             if payload.get("error") == "invalid_password":
-                message = payload.get("message") or "Password must be 8-128 characters."
+                message = payload.get("message") or PASSWORD_POLICY_MESSAGE
             elif payload.get("error") == "registration_failed":
                 message = "Registration failed."
             else:
@@ -748,19 +1097,13 @@ def login(username: str):
     expires_in = int(data.get("expires_in", 3600))
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
-    me_url = f"{_backend_url(state)}/api/me"
-    me_resp = _request("GET", me_url, token=token)
-    if me_resp.status_code != 200:
-        typer.secho(f"Login succeeded but failed to fetch /api/me: {me_resp.text}", fg=typer.colors.RED)
-        raise typer.Exit(1)
-
-    me = me_resp.json()
-    state["auth"] = {"token": token, "username": username, "expires_at": expires_at.isoformat()}
-    state["keys"] = {
-        "public_key": me["public_key"],
-        "encrypted_private_key": me["encrypted_private_key"],
+    state["auth"] = {
+        "token": token,
+        "username": username,
+        "role": "user",
+        "expires_at": expires_at.isoformat(),
     }
-    _save_state(state)
+    _refresh_me_profile(state, state["auth"])
 
     # Validate the supplied password can decrypt the stored private key blob.
     try:
@@ -781,21 +1124,41 @@ def shell():
         raise typer.Exit(1)
 
     username = auth["username"]
+    role = _auth_role(auth)
     private_key = _unlock_private_key_once(state)
     while True:
         typer.echo("")
+        options = [("1", "Send message"), ("2", "View messages"), ("3", "Chat")]
+        valid_choices = {"1", "2", "3"}
+        footer = ["Press 1-4"]
+        if role == "admin":
+            options.append(("4", "List users"))
+            options.append(("5", "Exit"))
+            valid_choices.add("4")
+            valid_choices.add("5")
+            footer = ["Press 1-5"]
+            default_choice = "5"
+        else:
+            options.append(("4", "Exit"))
+            valid_choices.add("4")
+            default_choice = "4"
         _print_menu(
             title="Secure Message Session",
-            options=[("1", "Send message"), ("2", "View messages"), ("3", "Chat"), ("4", "Exit")],
-            info_lines=[f"User: {username}", f"Backend: {_backend_url(state)}"],
-            footer_lines=["Press 1-4"],
+            options=options,
+            info_lines=[f"User: {username}", f"Role: {role}", f"Backend: {_backend_url(state)}"],
+            footer_lines=footer,
         )
-        choice = _prompt_choice(f"{username}@secure>", {"1", "2", "3", "4"}, default="4")
+        choice = _prompt_choice(f"{username}@secure>", valid_choices, default=default_choice)
 
         if choice == "1":
             recipient = typer.prompt("Recipient").strip()
             if not recipient:
                 typer.secho("Recipient required.", fg=typer.colors.RED)
+                continue
+            attachment_path = typer.prompt("Image path (leave blank for text)", default="", show_default=False).strip()
+            if attachment_path:
+                caption = typer.prompt("Caption (optional)", default="", show_default=False).strip()
+                send(recipient, caption or None, file=Path(attachment_path))
                 continue
             message = typer.prompt("Message").strip()
             if not message:
@@ -819,6 +1182,9 @@ def shell():
             with_user = _resolve_alias(state, with_user)
             _chat_flow(state, auth, with_user, private_key)
             continue
+        if choice == "4" and role == "admin":
+            admin_users()
+            continue
         raise typer.Exit()
 
 
@@ -828,7 +1194,11 @@ def whoami():
     state = _state()
     auth = state.get("auth") or {}
     if auth.get("username"):
-        typer.echo(auth["username"])
+        role = _auth_role(auth)
+        if role == "admin":
+            typer.echo(f"{auth['username']} (admin)")
+        else:
+            typer.echo(auth["username"])
     else:
         typer.echo("not logged in")
 
@@ -844,14 +1214,26 @@ def logout():
 
 # Send an encrypted message to a recipient.
 @app.command()
-def send(recipient: str, message: str, no_history: bool = typer.Option(False, "--no-history")):
+def send(
+    recipient: str,
+    message: Optional[str] = typer.Argument(None),
+    no_history: bool = typer.Option(False, "--no-history"),
+    file: Optional[Path] = typer.Option(None, "--file"),
+    caption: Optional[str] = typer.Option(None, "--caption"),
+):
     state = _state()
     auth = _require_auth(state)
     recipient = _resolve_alias(state, recipient)
+    if file is None and not message:
+        typer.secho("Provide a message or use --file for an image attachment.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    if file is not None and not file.exists():
+        typer.secho("Attachment file not found.", fg=typer.colors.RED)
+        raise typer.Exit(1)
 
     password = typer.prompt("Password", hide_input=True)
     try:
-        private_key = _load_private_key_from_state(state, password)
+        _load_private_key_from_state(state, password)
     except Exception:
         typer.secho("Failed to decrypt private key.", fg=typer.colors.RED)
         raise typer.Exit(1)
@@ -864,7 +1246,24 @@ def send(recipient: str, message: str, no_history: bool = typer.Option(False, "-
         raise typer.Exit(1)
 
     recipient_public_key = resp.json()["public_key"]
-    encrypted_key, ciphertext, iv = _encrypt_message(message, recipient_public_key)
+    content_to_encrypt = message or ""
+    history_plaintext = message or ""
+    if file is not None:
+        attachment_caption = caption if caption is not None else (message or "")
+        try:
+            content_to_encrypt, attachment_meta = _build_image_envelope(file, attachment_caption)
+        except OSError as exc:
+            typer.secho(f"Failed to read image: {exc}", fg=typer.colors.RED)
+            raise typer.Exit(1)
+        except ValueError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED)
+            raise typer.Exit(1)
+        history_plaintext = _message_content(content_to_encrypt)["display"]
+    elif caption:
+        typer.secho("--caption can only be used with --file.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    encrypted_key, ciphertext, iv = _encrypt_message(content_to_encrypt, recipient_public_key)
 
     payload = {
         "recipient": recipient,
@@ -886,12 +1285,16 @@ def send(recipient: str, message: str, no_history: bool = typer.Option(False, "-
             "id": msg_id,
             "sender": auth["username"],
             "recipient": recipient,
-            "plaintext": message,
+            "plaintext": history_plaintext,
+            "content": content_to_encrypt,
             "created_at": datetime.now(timezone.utc).isoformat(),
         },
         save_history=save_history,
     )
 
+    if file is not None:
+        typer.echo(f"Image sent (id={msg_id}, file={attachment_meta['name']}).")
+        return
     typer.echo(f"Message sent (id={msg_id}).")
 
 
@@ -948,15 +1351,17 @@ def read(with_user: str):
     history = _load_history()
     rows = []
     for msg in messages:
+        msg_id = str(msg.get("id", "?"))
         if msg["recipient"] == auth["username"]:
             try:
                 plaintext = _decrypt_message(msg["ciphertext"], msg["iv"], msg["encrypted_key"], private_key)
+                plaintext = _message_content(plaintext)["display"]
             except Exception:
                 plaintext = "[decryption failed]"
         else:
-            plaintext = history.get(str(msg["id"]), "[sent message not stored locally]")
-        rows.append([msg["created_at"], msg["sender"], msg["recipient"], plaintext])
-    _render_table(f"Conversation with {with_user}", ["Time", "From", "To", "Message"], rows)
+            plaintext = _history_display(history, msg.get("id"))
+        rows.append([msg_id, msg["created_at"], msg["sender"], msg["recipient"], plaintext])
+    _render_table(f"Conversation with {with_user}", ["Id", "Time", "From", "To", "Message"], rows)
 
 
 # Chat flow with simple paging and reply loop.
@@ -986,7 +1391,7 @@ def _chat_flow(
     while True:
         page = messages[start_index:]
         rows = _conversation_rows(page, auth["username"], private_key, history)
-        _render_table(f"Conversation with {with_user}", ["Time", "From", "To", "Message"], rows)
+        _render_table(f"Conversation with {with_user}", ["Id", "Time", "From", "To", "Message"], rows)
 
         if start_index == 0:
             console.print("No older messages.")
@@ -1000,6 +1405,11 @@ def _chat_flow(
             start_index = max(start_index - page_size, 0)
             continue
         if choice == "r":
+            attachment_path = typer.prompt("Image path (leave blank for text)", default="", show_default=False).strip()
+            if attachment_path:
+                caption = typer.prompt("Caption (optional)", default="", show_default=False).strip()
+                send(with_user, caption or None, file=Path(attachment_path))
+                continue
             message = typer.prompt("Message").strip()
             if not message:
                 typer.secho("Message required.", fg=typer.colors.RED)
@@ -1036,8 +1446,9 @@ def _load_history() -> dict:
     for line in HISTORY_FILE.read_text(encoding="utf-8").splitlines():
         try:
             entry = json.loads(line)
-            if "id" in entry and "plaintext" in entry:
-                history[str(entry["id"])] = entry["plaintext"]
+            parsed = _history_entry_from_record(entry)
+            if parsed is not None:
+                history[str(entry["id"])] = parsed
         except json.JSONDecodeError:
             continue
     return history

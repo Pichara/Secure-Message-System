@@ -6,7 +6,7 @@ Academic secure messaging project with **end-to-end encryption (E2EE)** and expl
 1. **E2EE by design**: messages are encrypted client‑side (AES‑GCM); the server stores only ciphertext.
 2. **Key management**: clients generate key pairs; private keys are encrypted with a password‑derived key.
 3. **Zero‑knowledge backend**: the server cannot decrypt message content.
-4. **Defense in depth**: strong auth, strict authorization, input validation, and secure error handling.
+4. **Defense in depth**: stronger registration passwords, role-gated admin views, input validation, and secure error handling.
 
 ## OWASP Top 10 Mapping (Summary)
 1. **Broken Access Control**: server enforces per‑user message access.
@@ -24,6 +24,7 @@ Academic secure messaging project with **end-to-end encryption (E2EE)** and expl
 - **Clients (Web/CLI)** → **Backend API** → **PostgreSQL**
 - API handles auth, public key lookup, and message storage (ciphertext only).
 - CLI defaults to a Textual TUI for messaging workflows.
+- Encrypted image attachments use the same message pipeline as text messages: the client encrypts a structured attachment envelope before upload, and recipients decrypt it locally.
 
 ## CLI Quickstart (TUI)
 ```powershell
@@ -34,6 +35,12 @@ TUI hotkeys:
 - `r` refresh contacts
 - `u` unlock inbox (decrypt)
 - `l` logout
+
+Current messaging support:
+- Text messages remain compatible with the original flow.
+- Image attachments are sent as encrypted message payloads and stay opaque to the backend.
+- Admin sessions can use a protected user-list view that returns usernames only.
+- Contacts are stored per user in PostgreSQL, not in local CLI state.
 
 ![Secure Message CLI](CLI.png)
 
@@ -46,8 +53,9 @@ TUI hotkeys:
 6. `POST /api/logout`
 7. `GET /api/me`
 8. `GET /api/users/{username}/public-key`
-9. `POST /api/messages`
-10. `GET /api/messages`
+9. `GET /api/admin/users`
+10. `POST /api/messages`
+11. `GET /api/messages`
    - Optional query params: `with`, `limit`, `order` (`asc|desc`), `before_id`
 
 ## API Notes
@@ -58,12 +66,13 @@ TUI hotkeys:
 
 ## Security Controls (Additional)
 - Input validation with bounded username/password lengths and allowed characters.
-- Passwords must be 8-128 characters.
+- Registration passwords must be 8-128 characters and include at least one number and one special character.
 - Request body size limits to reduce abuse.
 - Basic in-memory rate limiting on login/register (per IP and username).
 - Token cleanup for expired bearer tokens.
 - Optional HSTS via `HSTS_ENABLED=true` when serving over HTTPS.
 - CLI config masks sensitive values by default; local history can be disabled.
+- Admin-only listing endpoints must return usernames only, never password hashes, keys, or message metadata.
 
 ## Stack (Reference)
 - Backend: C++ (cpp‑httplib, nlohmann/json, libpqxx, libsodium)
