@@ -88,6 +88,23 @@ public class UserRepository
     }
 
     /// <summary>
+    /// Deletes a user by username
+    /// </summary>
+    public async Task<bool> DeleteByUsernameAsync(string username)
+    {
+        using var conn = _databaseService.GetConnection();
+        await conn.OpenAsync();
+
+        await using var cmd = new NpgsqlCommand(@"
+            DELETE FROM users WHERE username = $1
+        ", conn);
+        cmd.Parameters.AddWithValue(username);
+
+        int affected = await cmd.ExecuteNonQueryAsync();
+        return affected > 0;
+    }
+
+    /// <summary>
     /// Checks if a user exists by username
     /// </summary>
     public async Task<bool> ExistsAsync(string username)

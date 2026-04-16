@@ -194,7 +194,7 @@ def _admin_session_only_lists_users(auth: dict) -> bool:
 def _require_non_admin_messaging(auth: dict) -> None:
     if _admin_session_only_lists_users(auth):
         typer.secho(
-            "Admin sessions are limited to listing users. Run 'admin users' instead.",
+            "Admin sessions are limited to user management. Run 'admin users' or 'admin delete-user' instead.",
             fg=typer.colors.RED,
         )
         raise typer.Exit(1)
@@ -910,6 +910,34 @@ def admin_users():
     _render_table("Registered Users", ["Username"], rows)
 
 
+@admin_app.command("delete-user")
+def admin_delete_user(username: str, force: bool = typer.Option(False, "--force")):
+    state = _state()
+    auth = _require_auth(state)
+    _refresh_me_profile(state, auth)
+    auth = state["auth"]
+    if _auth_role(auth) != "admin":
+        typer.secho("Admin access required.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    target = username.strip()
+    if not target:
+        typer.secho("Username required.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    if not force and not typer.confirm(f"Delete user '{target}'?"):
+        typer.echo("Cancelled.")
+        raise typer.Exit(1)
+
+    url = f"{_backend_url(state)}/api/admin/users/{target}"
+    resp = _request("DELETE", url, token=auth["token"])
+    if resp.status_code != 200:
+        typer.secho(f"Delete user failed: {resp.text}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    typer.echo(f"Deleted user {target}.")
+
+
 @attachments_app.command("show")
 def attachments_show(message_id: int):
     state = _state()
@@ -1167,10 +1195,10 @@ def shell():
     while True:
         typer.echo("")
         if _admin_session_only_lists_users(auth):
-            options = [("1", "List users"), ("2", "Exit")]
-            valid_choices = {"1", "2"}
-            footer = ["Press 1-2"]
-            default_choice = "2"
+            options = [("1", "List users"), ("2", "Delete user"), ("3", "Exit")]
+            valid_choices = {"1", "2", "3"}
+            footer = ["Press 1-3"]
+            default_choice = "3"
         else:
             options = [("1", "Send message"), ("2", "View messages"), ("3", "Chat")]
             valid_choices = {"1", "2", "3"}
@@ -1189,6 +1217,13 @@ def shell():
         if _admin_session_only_lists_users(auth):
             if choice == "1":
                 admin_users()
+                continue
+            if choice == "2":
+                target_username = typer.prompt("Delete username").strip()
+                if not target_username:
+                    typer.secho("Username required.", fg=typer.colors.RED)
+                    continue
+                admin_delete_user(target_username)
                 continue
             raise typer.Exit()
 

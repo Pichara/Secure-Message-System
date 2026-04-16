@@ -227,6 +227,64 @@ public class AuthController : ControllerBase
         });
     }
 
+    /// <summary>
+    /// Delete a user account (admin only)
+    /// DELETE /api/admin/users/{username}
+    /// </summary>
+    [HttpDelete("admin/users/{username}")]
+    public async Task<IActionResult> AdminDeleteUser(string username)
+    {
+        string? authUsername = GetAuthenticatedUsername();
+        if (string.IsNullOrEmpty(authUsername))
+        {
+            return Unauthorized(new ErrorResponse { Error = "unauthorized" });
+        }
+
+        var adminUser = await _userRepository.GetByUsernameAsync(authUsername);
+        if (adminUser == null || adminUser.Role != Constants.AdminRole)
+        {
+            return StatusCode(StatusCodes.Status403Forbidden, new ErrorResponse { Error = "forbidden" });
+        }
+
+        if (!_passwordService.IsValidUsername(username))
+        {
+            return BadRequest(new ErrorResponse { Error = "invalid_username" });
+        }
+
+        if (string.Equals(authUsername, username, StringComparison.Ordinal))
+        {
+            return BadRequest(new ErrorResponse
+            {
+                Error = "cannot_delete_self",
+                Message = "Admins cannot delete their own account."
+            });
+        }
+
+        var targetUser = await _userRepository.GetByUsernameAsync(username);
+        if (targetUser == null)
+        {
+            return NotFound(new ErrorResponse { Error = "user_not_found" });
+        }
+
+        if (targetUser.Role == Constants.AdminRole)
+        {
+            return BadRequest(new ErrorResponse
+            {
+                Error = "cannot_delete_admin",
+                Message = "Admin accounts cannot be deleted."
+            });
+        }
+
+        bool deleted = await _userRepository.DeleteByUsernameAsync(username);
+        if (!deleted)
+        {
+            return NotFound(new ErrorResponse { Error = "user_not_found" });
+        }
+
+        _tokenService.InvalidateTokensForUser(username);
+        return Ok(new StatusResponse { Status = "deleted" });
+    }
+
     private string? GetAuthenticatedUsername()
     {
         string? token = ExtractBearerToken();

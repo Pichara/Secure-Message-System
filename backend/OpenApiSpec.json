@@ -160,6 +160,28 @@
         }
       }
     },
+    "/api/admin/users/{username}": {
+      "delete": {
+        "summary": "Delete a user account (admin only)",
+        "description": "Deletes a non-admin user account and cascades its messages and contacts.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": { "description": "User deleted" },
+          "400": { "description": "Invalid username or disallowed delete target" },
+          "401": { "description": "Unauthorized" },
+          "403": { "description": "Forbidden" },
+          "404": { "description": "User not found" }
+        }
+      }
+    },
     "/api/users/{username}/public-key": {
       "get": {
         "summary": "Get public key by username",

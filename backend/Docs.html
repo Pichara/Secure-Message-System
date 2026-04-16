@@ -25,13 +25,14 @@
       <li><code>POST /api/contacts</code></li>
       <li><code>DELETE /api/contacts/{alias}</code></li>
       <li><code>GET /api/admin/users</code> (admin only)</li>
+      <li><code>DELETE /api/admin/users/{username}</code> (admin only)</li>
       <li><code>GET /api/users/{username}/public-key</code></li>
       <li><code>POST /api/messages</code></li>
       <li><code>GET /api/messages</code> (with, limit, order, before_id)</li>
     </ul>
     <p>Protected endpoints require <code>Authorization: Bearer &lt;token&gt;</code>.</p>
     <p>New registrations require a password with 8-128 characters, at least one number, and at least one special character.</p>
-    <p>The admin user list is a separate protected endpoint and returns registered usernames only.</p>
+    <p>The admin endpoints can list registered usernames and delete non-admin user accounts.</p>
     <p>Message payloads are opaque encrypted blobs and may contain client-defined attachment envelopes for arbitrary files, including images.</p>
   </body>
 </html>

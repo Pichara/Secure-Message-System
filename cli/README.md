@@ -121,6 +121,11 @@ List registered usernames for an admin session:
 ```powershell
 python secure_message_cli.py admin users
 ```
+Delete a non-admin user:
+```powershell
+python secure_message_cli.py admin delete-user alice
+python secure_message_cli.py admin delete-user alice --force
+```
 `whoami` prints `username (admin)` for admin sessions.
 
 ## Contacts (aliases)

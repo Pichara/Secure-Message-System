@@ -96,6 +96,27 @@ public class TokenService
     }
 
     /// <summary>
+    /// Invalidates all active tokens for a given username
+    /// </summary>
+    public void InvalidateTokensForUser(string username)
+    {
+        CleanupExpiredTokens();
+
+        lock (_lock)
+        {
+            var matchingTokens = _tokens
+                .Where(kvp => string.Equals(kvp.Value.Username, username, StringComparison.Ordinal))
+                .Select(kvp => kvp.Key)
+                .ToList();
+
+            foreach (var token in matchingTokens)
+            {
+                _tokens.Remove(token);
+            }
+        }
+    }
+
+    /// <summary>
     /// Periodically removes expired tokens
     /// </summary>
     private void CleanupExpiredTokens()

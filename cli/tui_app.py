@@ -151,6 +151,26 @@ class InputDialog(ModalScreen[str]):
         self.dismiss(value)
 
 
+class ConfirmDialog(ModalScreen[bool]):
+    """Simple yes/no confirmation modal."""
+
+    def __init__(self, title: str, message: str) -> None:
+        super().__init__()
+        self._title = title
+        self._message = message
+
+    def compose(self) -> ComposeResult:
+        with Container(id="dialog"):
+            yield Static(self._title, id="dialog-title")
+            yield Static(self._message, id="dialog-message")
+            with Horizontal(id="dialog-actions"):
+                yield Button("Delete", id="confirm", variant="error")
+                yield Button("Cancel", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm")
+
+
 class NewChatDialog(ModalScreen[str]):
     """Centered modal that validates the target username before closing."""
 
@@ -452,7 +472,7 @@ class AuthScreen(Screen):
 
 
 class AdminDirectoryScreen(Screen):
-    """Read-only ADMIN view that only lists registered users."""
+    """Admin view for listing and deleting registered users."""
 
     BINDINGS = [
         ("r", "refresh", "Refresh"),
@@ -472,7 +492,7 @@ class AdminDirectoryScreen(Screen):
         color: #b0b0b0;
         margin-bottom: 1;
     }
-    #admin-user-log {
+    #admin-user-list {
         height: 18;
         border: round #4c4c4c;
         margin: 1 0;
@@ -489,15 +509,17 @@ class AdminDirectoryScreen(Screen):
     def __init__(self, auth: AuthState) -> None:
         super().__init__()
         self.auth = auth
+        self._selected_username: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Container(id="admin-directory"):
             yield Static("", id="admin-session-meta")
             yield Static("Registered Users", id="admin-title")
-            yield RichLog(id="admin-user-log", wrap=True)
+            yield ListView(id="admin-user-list")
             with Horizontal(id="admin-actions"):
                 yield Button("Refresh", id="refresh", variant="primary")
+                yield Button("Delete", id="delete", variant="error", disabled=True)
                 yield Button("Logout", id="logout")
         yield Static("", id="admin-status")
         yield Footer()
@@ -511,21 +533,41 @@ class AdminDirectoryScreen(Screen):
     def _set_status(self, message: str) -> None:
         self.query_one("#admin-status", Static).update(message)
 
+    def _sync_delete_button(self) -> None:
+        delete_button = self.query_one("#delete", Button)
+        delete_button.disabled = not bool(self._selected_username)
+
     def _show_users(self, usernames: list[str]) -> None:
-        log = self.query_one("#admin-user-log", RichLog)
-        log.clear()
+        list_view = self.query_one("#admin-user-list", ListView)
+        list_view.clear()
+        self._selected_username = None
+        self._sync_delete_button()
         if not usernames:
-            log.write("No users returned.")
             return
         for username in usernames:
-            log.write(username)
+            item = ListItem(Static(username))
+            item.username = username
+            list_view.append(item)
+
+        list_view.index = 0
+        self._selected_username = usernames[0]
+        self._sync_delete_button()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "refresh":
             self.action_refresh()
             return
+        if event.button.id == "delete":
+            self.action_delete_user()
+            return
         if event.button.id == "logout":
             self.action_logout()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id != "admin-user-list":
+            return
+        self._selected_username = getattr(event.item, "username", None)
+        self._sync_delete_button()
 
     def action_refresh(self) -> None:
         state = _state()
@@ -559,6 +601,49 @@ class AdminDirectoryScreen(Screen):
         usernames.sort()
         self._show_users(usernames)
         self._set_status(f"Loaded {len(usernames)} users.")
+
+    @work(exclusive=True)
+    async def action_delete_user(self) -> None:
+        if not self._selected_username:
+            self._set_status("Select a user first.")
+            return
+
+        username = self._selected_username
+        confirmed = await self.app.push_screen(
+            ConfirmDialog(
+                "Delete user",
+                f"Are you sure you want to delete '{username}'?",
+            ),
+            wait_for_dismiss=True,
+        )
+        if not confirmed:
+            self._set_status("Delete cancelled.")
+            return
+
+        state = _state()
+        auth = state.get("auth") or {}
+        resp = _request(
+            "DELETE",
+            f"{_backend_url(state)}/api/admin/users/{username}",
+            token=auth.get("token"),
+        )
+        if resp.status_code == 401:
+            self._set_status("Session expired. Please login again.")
+            self.app.push_screen(AuthScreen())
+            return
+        if resp.status_code == 403:
+            self._set_status("Admin access denied by server.")
+            return
+        if resp.status_code == 404:
+            self._set_status("User not found.")
+            self.action_refresh()
+            return
+        if resp.status_code != 200:
+            self._set_status(f"Delete failed: {resp.text}")
+            return
+
+        self._set_status(f"Deleted user {username}.")
+        self.action_refresh()
 
     def action_logout(self) -> None:
         state = _state()

@@ -44,6 +44,7 @@ This starts PostgreSQL and the backend with the correct `DATABASE_URL`.
 - `POST /api/logout`
 - `GET /api/me`
 - `GET /api/admin/users`
+- `DELETE /api/admin/users/{username}`
 - `GET /api/users/{username}/public-key`
 - `POST /api/messages`
 - `GET /api/messages?with={username}`
@@ -55,5 +56,6 @@ This starts PostgreSQL and the backend with the correct `DATABASE_URL`.
 - Tokens are short-lived (1 hour) and stored in memory (demo).
 - E2EE message content is stored as ciphertext only.
 - Admin access uses the normal login flow. User records default to `role=user`, `/api/me` returns that role, and `/api/admin/users` is restricted to admin accounts.
+- Admins can delete non-admin user accounts via `DELETE /api/admin/users/{username}`. Self-delete and deleting admin accounts are blocked.
 - Existing databases are migrated on startup to add the `role` column automatically.
 - Message storage remains opaque. The backend now accepts larger encrypted payloads so clients can send small attachment/image envelopes through the existing encrypted message pipeline.

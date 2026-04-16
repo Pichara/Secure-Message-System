@@ -48,7 +48,7 @@ def test_send_is_blocked_for_dedicated_admin(tmp_path, monkeypatch):
     result = runner.invoke(cli.app, ["send", "bob", "hello"])
 
     assert result.exit_code == 1
-    assert "Admin sessions are limited to listing users." in result.stdout
+    assert "Admin sessions are limited to user management." in result.stdout
 
 
 def test_shell_for_dedicated_admin_only_shows_directory_actions(tmp_path, monkeypatch):
@@ -75,8 +75,8 @@ def test_shell_for_dedicated_admin_only_shows_directory_actions(tmp_path, monkey
 
     assert result.exit_code == 0
     assert capture["title"] == "Secure Message Session"
-    assert capture["options"] == [("1", "List users"), ("2", "Exit")]
-    assert capture["footer_lines"] == ["Press 1-2"]
+    assert capture["options"] == [("1", "List users"), ("2", "Delete user"), ("3", "Exit")]
+    assert capture["footer_lines"] == ["Press 1-3"]
 
 
 def test_admin_users_lists_registered_usernames(tmp_path, monkeypatch):
@@ -107,3 +107,57 @@ def test_admin_users_lists_registered_usernames(tmp_path, monkeypatch):
     assert "Username" in result.stdout
     assert "ADMIN" in result.stdout
     assert "alice" in result.stdout
+
+
+def test_admin_delete_user_calls_backend_and_reports_success(tmp_path, monkeypatch):
+    _patch_state(monkeypatch, tmp_path, username="ADMIN", role="admin")
+    runner = CliRunner()
+
+    def fake_request(method: str, url: str, token=None, **kwargs):
+        assert token == "test-token"
+        if method == "GET" and url.endswith("/api/me"):
+            return _FakeResponse(
+                200,
+                {
+                    "username": "ADMIN",
+                    "role": "admin",
+                    "public_key": "public",
+                    "encrypted_private_key": "encrypted",
+                },
+            )
+        if method == "DELETE" and url.endswith("/api/admin/users/alice"):
+            return _FakeResponse(200, {"status": "deleted"})
+        raise AssertionError(f"Unexpected request: {method} {url}")
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+
+    result = runner.invoke(cli.app, ["admin", "delete-user", "alice", "--force"])
+
+    assert result.exit_code == 0
+    assert "Deleted user alice." in result.stdout
+
+
+def test_admin_delete_user_is_blocked_for_non_admin(tmp_path, monkeypatch):
+    _patch_state(monkeypatch, tmp_path, username="alice", role="user")
+    runner = CliRunner()
+
+    def fake_request(method: str, url: str, token=None, **kwargs):
+        assert token == "test-token"
+        if method == "GET" and url.endswith("/api/me"):
+            return _FakeResponse(
+                200,
+                {
+                    "username": "alice",
+                    "role": "user",
+                    "public_key": "public",
+                    "encrypted_private_key": "encrypted",
+                },
+            )
+        raise AssertionError(f"Unexpected request: {method} {url}")
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+
+    result = runner.invoke(cli.app, ["admin", "delete-user", "bob", "--force"])
+
+    assert result.exit_code == 1
+    assert "Admin access required." in result.stdout

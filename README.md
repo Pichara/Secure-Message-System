@@ -39,7 +39,7 @@ TUI hotkeys:
 Current messaging support:
 - Text messages remain compatible with the original flow.
 - Image attachments are sent as encrypted message payloads and stay opaque to the backend.
-- Admin sessions can use a protected user-list view that returns usernames only.
+- Admin sessions can list registered usernames and delete non-admin accounts.
 - Contacts are stored per user in PostgreSQL, not in local CLI state.
 
 ![Secure Message CLI](CLI.png)
@@ -54,8 +54,9 @@ Current messaging support:
 7. `GET /api/me`
 8. `GET /api/users/{username}/public-key`
 9. `GET /api/admin/users`
-10. `POST /api/messages`
-11. `GET /api/messages`
+10. `DELETE /api/admin/users/{username}`
+11. `POST /api/messages`
+12. `GET /api/messages`
    - Optional query params: `with`, `limit`, `order` (`asc|desc`), `before_id`
 
 ## API Notes
@@ -72,7 +73,8 @@ Current messaging support:
 - Token cleanup for expired bearer tokens.
 - Optional HSTS via `HSTS_ENABLED=true` when serving over HTTPS.
 - CLI config masks sensitive values by default; local history can be disabled.
-- Admin-only listing endpoints must return usernames only, never password hashes, keys, or message metadata.
+- Admin listing endpoints return usernames only, never password hashes, keys, or message metadata.
+- Admin delete operations are limited to non-admin accounts.
 
 ## Stack (Reference)
 - Backend: C# / ASP.NET Core 8

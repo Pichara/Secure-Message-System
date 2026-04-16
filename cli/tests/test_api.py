@@ -287,11 +287,13 @@ def test_api_admin_user_listing_requires_admin_and_returns_usernames_only():
     if not _health_check():
         pytest.skip("Backend is not reachable")
 
-    admin_username = "ADMIN"
+    admin_username = f"admin_{uuid.uuid4().hex[:8]}"
     member_username = f"member_{uuid.uuid4().hex[:8]}"
     password = "Password!123"
 
+    _register_user(admin_username, password)
     _register_user(member_username, password)
+    _promote_user_to_admin(admin_username)
 
     member_token = _login(member_username, password)
     forbidden = requests.get(
@@ -323,6 +325,59 @@ def test_api_admin_user_listing_requires_admin_and_returns_usernames_only():
     assert member_username in usernames
     for user in payload["users"]:
         assert set(user.keys()) == {"username"}
+
+
+@pytest.mark.e2e
+def test_api_admin_can_delete_non_admin_users_and_revoke_their_token():
+    if not _health_check():
+        pytest.skip("Backend is not reachable")
+
+    admin_username = f"admin_{uuid.uuid4().hex[:8]}"
+    member_username = f"member_{uuid.uuid4().hex[:8]}"
+    password = "Password!123"
+
+    _register_user(admin_username, password)
+    _register_user(member_username, password)
+    _promote_user_to_admin(admin_username)
+
+    admin_token = _login(admin_username, password)
+    member_token = _login(member_username, password)
+
+    forbidden = requests.delete(
+        f"{BACKEND_URL}/api/admin/users/{member_username}",
+        headers=_auth_headers(member_token),
+        timeout=10,
+    )
+    assert forbidden.status_code == 403
+
+    deleted = requests.delete(
+        f"{BACKEND_URL}/api/admin/users/{member_username}",
+        headers=_auth_headers(admin_token),
+        timeout=10,
+    )
+    assert deleted.status_code == 200
+    assert deleted.json()["status"] == "deleted"
+
+    login_after = requests.post(
+        f"{BACKEND_URL}/api/login",
+        json={"username": member_username, "password": password},
+        timeout=10,
+    )
+    assert login_after.status_code == 401
+
+    me_after = requests.get(
+        f"{BACKEND_URL}/api/me",
+        headers=_auth_headers(member_token),
+        timeout=10,
+    )
+    assert me_after.status_code == 401
+
+    cannot_delete_self = requests.delete(
+        f"{BACKEND_URL}/api/admin/users/{admin_username}",
+        headers=_auth_headers(admin_token),
+        timeout=10,
+    )
+    assert cannot_delete_self.status_code == 400
 
 
 @pytest.mark.e2e

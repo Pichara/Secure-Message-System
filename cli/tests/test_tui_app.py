@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 
 import tui_app
 from textual.widgets import Button
-from tui_app import AttachFileDialog, AuthState, MessageScreen, NewChatDialog, SecureMessageTUI
+from tui_app import AdminDirectoryScreen, AttachFileDialog, AuthState, ConfirmDialog, MessageScreen, NewChatDialog, SecureMessageTUI
 
 
 class _FakeResponse:
@@ -249,5 +249,91 @@ def test_attach_file_sends_immediately_without_caption(monkeypatch):
                 await pilot.pause()
                 assert sent_payloads == ["encrypted-payload"]
                 assert str(screen.query_one("#status").renderable) == "Attachment sent: evidence.bin."
+
+    asyncio.run(scenario())
+
+
+def test_admin_directory_renders_selectable_users_and_enables_delete(monkeypatch):
+    async def scenario():
+        app = SecureMessageTUI()
+        screen = AdminDirectoryScreen(AuthState(token="test-token", username="ADMIN", role="admin"))
+
+        monkeypatch.setattr(
+            tui_app,
+            "_state",
+            lambda: {"auth": {"token": "test-token", "username": "ADMIN", "role": "admin"}, "backend_url": "http://localhost:8080"},
+        )
+        monkeypatch.setattr(tui_app, "_backend_url", lambda state: "http://localhost:8080")
+
+        def fake_request(method: str, url: str, token=None, **kwargs):
+            assert token == "test-token"
+            if method == "GET" and url.endswith("/api/admin/users"):
+                return _FakeResponse(200, {"users": [{"username": "ADMIN"}, {"username": "alice"}]})
+            raise AssertionError(f"Unexpected request: {method} {url}")
+
+        monkeypatch.setattr(tui_app, "_request", fake_request)
+
+        async with app.run_test() as pilot:
+            app.push_screen(screen)
+            await pilot.pause()
+
+            list_view = screen.query_one("#admin-user-list")
+            delete_button = screen.query_one("#delete", Button)
+
+            assert len(list_view.children) == 2
+            assert screen._selected_username == "ADMIN"
+            assert delete_button.disabled is False
+
+    asyncio.run(scenario())
+
+
+def test_admin_directory_delete_user_confirms_then_refreshes(monkeypatch):
+    async def scenario():
+        app = SecureMessageTUI()
+        screen = AdminDirectoryScreen(AuthState(token="test-token", username="ADMIN", role="admin"))
+        requests: list[tuple[str, str]] = []
+        refresh_round = {"value": 0}
+
+        monkeypatch.setattr(
+            tui_app,
+            "_state",
+            lambda: {"auth": {"token": "test-token", "username": "ADMIN", "role": "admin"}, "backend_url": "http://localhost:8080"},
+        )
+        monkeypatch.setattr(tui_app, "_backend_url", lambda state: "http://localhost:8080")
+
+        def fake_request(method: str, url: str, token=None, **kwargs):
+            assert token == "test-token"
+            requests.append((method, url))
+            if method == "GET" and url.endswith("/api/admin/users"):
+                if refresh_round["value"] == 0:
+                    refresh_round["value"] = 1
+                    return _FakeResponse(200, {"users": [{"username": "ADMIN"}, {"username": "alice"}]})
+                return _FakeResponse(200, {"users": [{"username": "ADMIN"}]})
+            if method == "DELETE" and url.endswith("/api/admin/users/alice"):
+                return _FakeResponse(200, {"status": "deleted"})
+            raise AssertionError(f"Unexpected request: {method} {url}")
+
+        async def fake_push_screen(screen_obj, wait_for_dismiss=False):
+            if isinstance(screen_obj, ConfirmDialog):
+                return True
+            return None
+
+        monkeypatch.setattr(tui_app, "_request", fake_request)
+
+        async with app.run_test() as pilot:
+            app.push_screen(screen)
+            await pilot.pause()
+            monkeypatch.setattr(app, "push_screen", fake_push_screen)
+
+            screen._selected_username = "alice"
+            screen._sync_delete_button()
+            worker = screen.action_delete_user()
+            await worker.wait()
+            await pilot.pause()
+
+            usernames = [getattr(item, "username", None) for item in screen.query_one("#admin-user-list").children]
+            assert ("DELETE", "http://localhost:8080/api/admin/users/alice") in requests
+            assert usernames == ["ADMIN"]
+            assert str(screen.query_one("#admin-status").renderable) == "Loaded 1 users."
 
     asyncio.run(scenario())
