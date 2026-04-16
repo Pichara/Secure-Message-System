@@ -878,7 +878,11 @@ class MessageScreen(Screen):
             return None
 
         download_dir = Path.home() / "Downloads"
-        saved_path = _write_attachment_file(download_dir, str(content.get("name") or "attachment.bin"), raw_bytes)
+        try:
+            saved_path = _write_attachment_file(download_dir, str(content.get("name") or "attachment.bin"), raw_bytes)
+        except PermissionError:
+            self._set_status("Attachment could not be saved. Close the file or choose a different location.")
+            return None
         self._set_status(f"Attachment saved to {saved_path}.")
         return saved_path
 

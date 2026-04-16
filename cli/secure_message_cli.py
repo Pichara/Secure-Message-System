@@ -627,6 +627,16 @@ def _write_attachment_file(output_path: Path, name: str, raw_bytes: bytes) -> Pa
         target = output_path / name
 
     target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        stem = target.stem or "attachment"
+        suffix = target.suffix
+        for index in range(1, 10_000):
+            candidate = target.with_name(f"{stem} ({index}){suffix}")
+            if not candidate.exists():
+                target = candidate
+                break
+        else:
+            raise OSError(f"Unable to find available filename for {target.name}.")
     target.write_bytes(raw_bytes)
     if os.name != "nt":
         target.chmod(0o600)

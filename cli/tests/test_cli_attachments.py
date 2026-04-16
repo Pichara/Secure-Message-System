@@ -43,3 +43,14 @@ def test_attachments_save_treats_suffixless_path_as_directory(tmp_path, monkeypa
     assert saved_file.exists()
     assert saved_file.read_bytes() == b"payload"
     assert "Saved attachment from local history" in result.stdout
+
+
+def test_write_attachment_file_uses_unique_name_when_target_exists(tmp_path):
+    original = tmp_path / "proof.bin"
+    original.write_bytes(b"existing")
+
+    saved_file = cli._write_attachment_file(tmp_path, "proof.bin", b"payload")
+
+    assert saved_file == tmp_path / "proof (1).bin"
+    assert saved_file.read_bytes() == b"payload"
+    assert original.read_bytes() == b"existing"

@@ -1,14 +1,30 @@
 # Python
 .venv/
-__pycache__/
+**/__pycache__/
 *.pyc
+*.pyo
 .pytest_cache/
+**/.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Node/JS (if added later)
+# Node/JS
 node_modules/
+**/node_modules/
+dist/
+**/dist/
+dist-ssr/
+*.tsbuildinfo
+
+# .NET
+**/bin/
+**/obj/
+.vs/
 
 # Build outputs
 **/build/
+coverage/
+**/coverage/
 
 # Env
 .env
@@ -17,3 +33,14 @@ node_modules/
 
 # Logs
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS / editors
+.DS_Store
+.idea/
+*.suo
+*.user
+*.swp

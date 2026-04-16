@@ -215,6 +215,37 @@ def test_attach_file_dialog_keeps_modal_open_for_missing_path():
     asyncio.run(scenario())
 
 
+def test_save_attachment_from_content_shows_status_on_permission_error(monkeypatch):
+    async def scenario():
+        app = SecureMessageTUI()
+        screen = MessageScreen(AuthState(token="test-token", username="alice"))
+
+        monkeypatch.setattr(
+            tui_app,
+            "_write_attachment_file",
+            lambda output_path, name, raw_bytes: (_ for _ in ()).throw(PermissionError("denied")),
+        )
+
+        async with app.run_test() as pilot:
+            app.push_screen(screen)
+            await pilot.pause()
+            saved_path = screen._save_attachment_from_content(
+                {
+                    "name": "proof.bin",
+                    "bytes_b64": "cGF5bG9hZA==",
+                }
+            )
+            await pilot.pause()
+
+            assert saved_path is None
+            assert (
+                str(screen.query_one("#status").renderable)
+                == "Attachment could not be saved. Close the file or choose a different location."
+            )
+
+    asyncio.run(scenario())
+
+
 def test_attach_file_sends_immediately_without_caption(monkeypatch):
     async def scenario():
         app = SecureMessageTUI()
