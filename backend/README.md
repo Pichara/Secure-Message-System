@@ -9,8 +9,15 @@ ASP.NET Core 8 backend API for the secure messaging project, backed by PostgreSQ
 
 ## Environment Variables
 - `DATABASE_URL` (required)
-  - Example: `postgresql://postgres:postgres@localhost:5432/secure_message`
+  - Example: `postgresql://app_user:change-me@localhost:5432/secure_message`
 - `PORT` (optional, default `8080`)
+- `BOOTSTRAP_ADMIN_USERNAME` (optional)
+- `BOOTSTRAP_ADMIN_PASSWORD` (optional)
+- `BOOTSTRAP_ADMIN_PUBLIC_KEY` (required when bootstrap admin username/password are set)
+- `BOOTSTRAP_ADMIN_ENCRYPTED_PRIVATE_KEY` (required when bootstrap admin username/password are set)
+- `CORS_ORIGIN` (optional)
+- `HSTS_ENABLED` (optional)
+- `TRUST_PROXY_HEADERS` (optional)
 
 ## Build (local)
 ```powershell
@@ -20,14 +27,14 @@ dotnet build
 
 ## Run (local)
 ```powershell
-$env:DATABASE_URL="postgresql://postgres:postgres@localhost:5432/secure_message"
+$env:DATABASE_URL="postgresql://app_user:change-me@localhost:5432/secure_message"
 dotnet run
 ```
 
 ## Docker
 ```powershell
 docker build -t secure-message-backend -f Dockerfile .
-docker run -p 8080:8080 -e DATABASE_URL="postgresql://postgres:postgres@host.docker.internal:5432/secure_message" secure-message-backend
+docker run -p 8080:8080 -e DATABASE_URL="postgresql://app_user:change-me@host.docker.internal:5432/secure_message" secure-message-backend
 ```
 
 ## Docker Compose (recommended)

@@ -15,8 +15,6 @@ public static class Constants
 
     public const string UserRole = "user";
     public const string AdminRole = "admin";
-    public const string BootstrapAdminPublicKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-    public const string BootstrapAdminEncryptedPrivateKey = "{\"ciphertext\":\"\",\"salt\":\"\",\"nonce\":\"\"}";
 
     public static TimeSpan TokenTtl = TimeSpan.FromHours(1);
     public static TimeSpan TokenCleanupInterval = TimeSpan.FromMinutes(5);

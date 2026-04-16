@@ -69,7 +69,8 @@ def _b64encode(data: bytes) -> str:
 
 # Decode URL-safe base64 strings back to bytes.
 def _b64decode(data: str) -> bytes:
-    return base64.urlsafe_b64decode(data.encode("ascii"))
+    padded = data + "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
 
 
 # Load persisted CLI state (or defaults if missing).
@@ -269,7 +270,15 @@ def _load_private_key_from_state(state: dict, password: str) -> x25519.X25519Pri
         typer.secho("No local private key found. Login to fetch it.", fg=typer.colors.RED)
         raise typer.Exit(1)
     private_bytes = _decrypt_private_key(encrypted_payload, password)
-    return x25519.X25519PrivateKey.from_private_bytes(private_bytes)
+    try:
+        return x25519.X25519PrivateKey.from_private_bytes(private_bytes)
+    except ValueError:
+        # Frontend-created accounts store the X25519 private key as PKCS#8,
+        # while the legacy CLI stores raw 32-byte key material.
+        loaded_key = serialization.load_der_private_key(private_bytes, password=None)
+        if not isinstance(loaded_key, x25519.X25519PrivateKey):
+            raise ValueError("Unsupported private key format.")
+        return loaded_key
 
 
 # Encrypt a message using X25519 ECDH + HKDF + AES-GCM.
@@ -308,8 +317,41 @@ def _encrypt_message(plaintext: str, recipient_public_b64: str) -> tuple[str, st
 
 
 # Decrypt a message given the encrypted key payload and recipient private key.
-def _decrypt_message(ciphertext_b64: str, iv_b64: str, encrypted_key_payload: str, private_key: x25519.X25519PrivateKey) -> str:
+def _decrypt_message(
+    ciphertext_b64: str,
+    iv_b64: str,
+    encrypted_key_payload: str,
+    private_key: x25519.X25519PrivateKey,
+    username: Optional[str] = None,
+) -> str:
     data = json.loads(encrypted_key_payload)
+
+    if data.get("v") == 2 and isinstance(data.get("copies"), dict):
+        copies: dict[str, dict[str, str]] = data["copies"]
+        selected_copy = copies.get(username) if username else None
+        if selected_copy is None:
+            selected_copy = next(iter(copies.values()), None)
+        if selected_copy is None:
+            raise ValueError("No encrypted key copy available.")
+
+        eph_public = x25519.X25519PublicKey.from_public_bytes(_b64decode(selected_copy["epk"]))
+        salt = _b64decode(selected_copy["salt"])
+        wrap_iv = _b64decode(selected_copy["iv"])
+        wrapped_key = _b64decode(selected_copy["key"])
+
+        shared = private_key.exchange(eph_public)
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            info=b"secure-message-key-wrap-v2",
+        )
+        wrapping_key = hkdf.derive(shared)
+        raw_message_key = AESGCM(wrapping_key).decrypt(wrap_iv, wrapped_key, None)
+
+        plaintext = AESGCM(raw_message_key).decrypt(_b64decode(iv_b64), _b64decode(ciphertext_b64), None)
+        return plaintext.decode("utf-8")
+
     eph_public = x25519.X25519PublicKey.from_public_bytes(_b64decode(data["epk"]))
     salt = _b64decode(data["salt"])
 
@@ -568,6 +610,7 @@ def _message_content_for_id(
             target.get("iv", ""),
             target.get("encrypted_key", ""),
             private_key,
+            auth.get("username"),
         )
     except Exception:
         typer.secho("Failed to decrypt message.", fg=typer.colors.RED)
@@ -808,24 +851,22 @@ def _conversation_rows(
         sender = msg.get("sender", "unknown")
         recipient = msg.get("recipient", "unknown")
         created_at = msg.get("created_at", "unknown")
-        if recipient == username:
-            if private_key is None:
-                # Inbox remains locked until the user unlocks the private key locally.
-                plaintext = "[inbox locked]"
-            else:
-                try:
-                    plaintext = _decrypt_message(
-                        msg.get("ciphertext", ""),
-                        msg.get("iv", ""),
-                        msg.get("encrypted_key", ""),
-                        private_key,
-                    )
-                    plaintext = _message_content(plaintext)["display"]
-                except Exception:
-                    plaintext = "[decryption failed]"
+        if private_key is None:
+            plaintext = "[inbox locked]" if recipient == username else _history_display(history, msg.get("id"))
         else:
-            # Sent-message plaintext is stored locally only (server never sees it).
-            plaintext = _history_display(history, msg.get("id"))
+            try:
+                plaintext = _decrypt_message(
+                    msg.get("ciphertext", ""),
+                    msg.get("iv", ""),
+                    msg.get("encrypted_key", ""),
+                    private_key,
+                    username,
+                )
+                plaintext = _message_content(plaintext)["display"]
+            except Exception:
+                # Legacy sent messages may not include a sender copy, so keep the
+                # old local-history fallback for those.
+                plaintext = "[decryption failed]" if recipient == username else _history_display(history, msg.get("id"))
         rows.append([msg_id, _format_message_timestamp(created_at), sender, recipient, plaintext])
     return rows
 
@@ -1431,7 +1472,13 @@ def read(with_user: str):
         msg_id = str(msg.get("id", "?"))
         if msg["recipient"] == auth["username"]:
             try:
-                plaintext = _decrypt_message(msg["ciphertext"], msg["iv"], msg["encrypted_key"], private_key)
+                plaintext = _decrypt_message(
+                    msg["ciphertext"],
+                    msg["iv"],
+                    msg["encrypted_key"],
+                    private_key,
+                    auth["username"],
+                )
                 plaintext = _message_content(plaintext)["display"]
             except Exception:
                 plaintext = "[decryption failed]"

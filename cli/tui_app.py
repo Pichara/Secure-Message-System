@@ -903,26 +903,34 @@ class MessageScreen(Screen):
             sender = msg.get("sender", "unknown")
             recipient = msg.get("recipient", "unknown")
             created_at = msg.get("created_at", "unknown")
-            if recipient == auth.get("username"):
-                if self.private_key is None:
-                    parsed_content = {"kind": "text", "display": "[message unavailable]"}
-                else:
-                    try:
-                        plaintext = _decrypt_message(
-                            msg.get("ciphertext", ""),
-                            msg.get("iv", ""),
-                            msg.get("encrypted_key", ""),
-                            self.private_key,
-                        )
-                        parsed_content = _message_content(plaintext)
-                    except Exception:
-                        parsed_content = {"kind": "text", "display": "[decryption failed]"}
+            if self.private_key is None:
+                parsed_content = (
+                    {"kind": "text", "display": "[message unavailable]"}
+                    if recipient == auth.get("username")
+                    else history_map.get(str(msg.get("id"))) or {
+                        "kind": "text",
+                        "display": _history_display(history_map, msg.get("id")),
+                    }
+                )
             else:
-                # Sent-message plaintext is only stored locally (optional); server stores ciphertext only.
-                parsed_content = history_map.get(str(msg.get("id"))) or {
-                    "kind": "text",
-                    "display": _history_display(history_map, msg.get("id")),
-                }
+                try:
+                    plaintext = _decrypt_message(
+                        msg.get("ciphertext", ""),
+                        msg.get("iv", ""),
+                        msg.get("encrypted_key", ""),
+                        self.private_key,
+                        auth.get("username"),
+                    )
+                    parsed_content = _message_content(plaintext)
+                except Exception:
+                    parsed_content = (
+                        {"kind": "text", "display": "[decryption failed]"}
+                        if recipient == auth.get("username")
+                        else history_map.get(str(msg.get("id"))) or {
+                            "kind": "text",
+                            "display": _history_display(history_map, msg.get("id")),
+                        }
+                    )
             self._render_message_widget(
                 _format_message_log_line(
                     created_at,

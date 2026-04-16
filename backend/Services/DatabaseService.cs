@@ -1,3 +1,4 @@
+// Security configuration hardening by Rodrigo P Gomes.
 using Npgsql;
 using SecureMessageBackend.Models;
 
@@ -19,17 +20,15 @@ public class DatabaseService
 
         if (string.IsNullOrEmpty(dbUrl))
         {
-            dbUrl = "postgresql://postgres:postgres@localhost:5432/secure_message";
+            throw new InvalidOperationException("DATABASE_URL (or DefaultConnection) must be configured via environment or app settings.");
         }
 
         _connectionString = ConvertDatabaseUrlToNpgsqlConnectionString(dbUrl);
         _passwordService = passwordService;
         _bootstrapAdminUsername = Environment.GetEnvironmentVariable("BOOTSTRAP_ADMIN_USERNAME");
         _bootstrapAdminPassword = Environment.GetEnvironmentVariable("BOOTSTRAP_ADMIN_PASSWORD");
-        _bootstrapAdminPublicKey = Environment.GetEnvironmentVariable("BOOTSTRAP_ADMIN_PUBLIC_KEY")
-            ?? Constants.BootstrapAdminPublicKey;
-        _bootstrapAdminEncryptedPrivateKey = Environment.GetEnvironmentVariable("BOOTSTRAP_ADMIN_ENCRYPTED_PRIVATE_KEY")
-            ?? Constants.BootstrapAdminEncryptedPrivateKey;
+        _bootstrapAdminPublicKey = Environment.GetEnvironmentVariable("BOOTSTRAP_ADMIN_PUBLIC_KEY") ?? string.Empty;
+        _bootstrapAdminEncryptedPrivateKey = Environment.GetEnvironmentVariable("BOOTSTRAP_ADMIN_ENCRYPTED_PRIVATE_KEY") ?? string.Empty;
     }
 
     private string ConvertDatabaseUrlToNpgsqlConnectionString(string databaseUrl)
@@ -151,6 +150,12 @@ public class DatabaseService
         {
             Console.WriteLine("Bootstrap admin skipped: BOOTSTRAP_ADMIN_USERNAME/BOOTSTRAP_ADMIN_PASSWORD not set.");
             return;
+        }
+
+        if (string.IsNullOrWhiteSpace(_bootstrapAdminPublicKey) || string.IsNullOrWhiteSpace(_bootstrapAdminEncryptedPrivateKey))
+        {
+            throw new InvalidOperationException(
+                "BOOTSTRAP_ADMIN_PUBLIC_KEY and BOOTSTRAP_ADMIN_ENCRYPTED_PRIVATE_KEY must be set when bootstrap admin credentials are configured.");
         }
 
         string passwordHash = _passwordService.HashPassword(_bootstrapAdminPassword);

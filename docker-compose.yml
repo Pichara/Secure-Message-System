@@ -3,15 +3,15 @@ services:
     image: postgres:16
     container_name: secure-message-db
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: secure_message
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB}"
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d secure_message"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -23,15 +23,18 @@ services:
       dockerfile: Dockerfile
     container_name: secure-message-backend
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/secure_message
-      PORT: "8080"
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}"
+      PORT: "${BACKEND_PORT:-8080}"
       ASPNETCORE_URLS: http://+:8080
       BOOTSTRAP_ADMIN_USERNAME: "${BOOTSTRAP_ADMIN_USERNAME}"
       BOOTSTRAP_ADMIN_PASSWORD: "${BOOTSTRAP_ADMIN_PASSWORD}"
-      BOOTSTRAP_ADMIN_PUBLIC_KEY: "${BOOTSTRAP_ADMIN_PUBLIC_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}"
-      BOOTSTRAP_ADMIN_ENCRYPTED_PRIVATE_KEY: '${BOOTSTRAP_ADMIN_ENCRYPTED_PRIVATE_KEY:-{"ciphertext":"","salt":"","nonce":""}}'
+      BOOTSTRAP_ADMIN_PUBLIC_KEY: "${BOOTSTRAP_ADMIN_PUBLIC_KEY}"
+      BOOTSTRAP_ADMIN_ENCRYPTED_PRIVATE_KEY: '${BOOTSTRAP_ADMIN_ENCRYPTED_PRIVATE_KEY}'
+      CORS_ORIGIN: "${CORS_ORIGIN:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,http://localhost:4173,http://127.0.0.1:4173}"
+      HSTS_ENABLED: "${HSTS_ENABLED:-false}"
+      TRUST_PROXY_HEADERS: "${TRUST_PROXY_HEADERS:-false}"
     ports:
-      - "8080:8080"
+      - "${BACKEND_PORT:-8080}:8080"
     depends_on:
       db:
         condition: service_healthy

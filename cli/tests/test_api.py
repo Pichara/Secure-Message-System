@@ -153,6 +153,38 @@ def test_api_docs_available():
     resp = requests.get(f"{BACKEND_URL}/api/docs", timeout=10)
     assert resp.status_code == 200
     assert "openapi" in resp.text.lower()
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+    assert resp.headers["X-Frame-Options"] == "DENY"
+    assert resp.headers["Referrer-Policy"] == "no-referrer"
+    assert "frame-ancestors 'none'" in resp.headers["Content-Security-Policy"]
+
+
+@pytest.mark.e2e
+def test_api_cors_defaults_allow_localhost_and_reject_untrusted_origin():
+    if not _health_check():
+        pytest.skip("Backend is not reachable")
+
+    allowed = requests.options(
+        f"{BACKEND_URL}/api/login",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+        },
+        timeout=10,
+    )
+    assert allowed.status_code == 204
+    assert allowed.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
+
+    blocked = requests.options(
+        f"{BACKEND_URL}/api/login",
+        headers={
+            "Origin": "https://evil.example",
+            "Access-Control-Request-Method": "POST",
+        },
+        timeout=10,
+    )
+    assert blocked.status_code == 403
+    assert blocked.json()["error"] == "cors_denied"
 
 
 @pytest.mark.e2e

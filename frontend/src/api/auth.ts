@@ -1,3 +1,4 @@
+// Frontend security updates by Rodrigo P Gomes and Negin Karimi.
 import { apiRequest, setToken, clearToken } from "./client";
 
 interface RegisterPayload extends Record<string, unknown> {
@@ -23,7 +24,7 @@ export async function register(payload: RegisterPayload) {
 export async function logout() {
   try {
     await apiRequest("POST", "/api/logout");
-  } catch (e) {
+  } catch {
     // Ignore logout errors
   }
   clearToken();

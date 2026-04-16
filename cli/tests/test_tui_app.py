@@ -150,7 +150,7 @@ def test_attachment_messages_render_clickable_and_save_on_click(monkeypatch):
             monkeypatch.setattr(
                 tui_app,
                 "_decrypt_message",
-                lambda ciphertext, iv, encrypted_key, private_key: '{"kind":"attachment","caption":"","attachment":{"name":"proof.bin","mime":"application/octet-stream","size_bytes":7,"bytes_b64":"cGF5bG9hZA=="}}',
+                lambda ciphertext, iv, encrypted_key, private_key, username=None: '{"kind":"attachment","caption":"","attachment":{"name":"proof.bin","mime":"application/octet-stream","size_bytes":7,"bytes_b64":"cGF5bG9hZA=="}}',
             )
 
             def fake_request(method: str, url: str, token=None, **kwargs):

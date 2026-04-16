@@ -5,8 +5,14 @@ import uuid
 
 import pytest
 import requests
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import serialization
 
 from secure_message_cli import (
+    _b64encode,
     _decrypt_message,
     _encrypt_message,
     _encrypt_private_key,
@@ -51,6 +57,44 @@ def _login(username: str, password: str) -> str:
 
 def _auth_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+def _encrypt_message_v2_for_recipients(
+    plaintext: str,
+    recipients: list[tuple[str, x25519.X25519PublicKey]],
+) -> tuple[str, str, str]:
+    message_key = AESGCM.generate_key(bit_length=256)
+    iv = os.urandom(12)
+    ciphertext = AESGCM(message_key).encrypt(iv, plaintext.encode("utf-8"), None)
+
+    copies: dict[str, dict[str, str]] = {}
+    for username, recipient_public in recipients:
+        eph_private = x25519.X25519PrivateKey.generate()
+        eph_public = eph_private.public_key()
+        shared = eph_private.exchange(recipient_public)
+        salt = os.urandom(16)
+        wrap_iv = os.urandom(12)
+        wrapping_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            info=b"secure-message-key-wrap-v2",
+        ).derive(shared)
+        wrapped_key = AESGCM(wrapping_key).encrypt(wrap_iv, message_key, None)
+
+        copies[username] = {
+            "epk": _b64encode(
+                eph_public.public_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PublicFormat.Raw,
+                )
+            ),
+            "salt": _b64encode(salt),
+            "iv": _b64encode(wrap_iv),
+            "key": _b64encode(wrapped_key),
+        }
+
+    return json.dumps({"v": 2, "copies": copies}), _b64encode(ciphertext), _b64encode(iv)
 
 
 def _file_envelope(filename: str = "evidence.bin", caption: str = "test file") -> dict:
@@ -147,6 +191,29 @@ def test_attachment_envelope_round_trip_preserves_text_compatibility():
     assert base64.b64decode(decoded["attachment"]["bytes_b64"]) == base64.b64decode(
         envelope["attachment"]["bytes_b64"]
     )
+
+
+def test_cli_can_decrypt_frontend_v2_message_format():
+    recipient_private, recipient_public = _generate_keypair()
+    sender_private, sender_public = _generate_keypair()
+
+    plaintext = "frontend v2 payload"
+    encrypted_key, ciphertext, iv = _encrypt_message_v2_for_recipients(
+        plaintext,
+        [
+            ("recipient", recipient_public),
+            ("sender", sender_public),
+        ],
+    )
+
+    decrypted = _decrypt_message(
+        ciphertext,
+        iv,
+        encrypted_key,
+        recipient_private,
+        "recipient",
+    )
+    assert decrypted == plaintext
 
 
 @pytest.mark.e2e

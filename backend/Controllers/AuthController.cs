@@ -1,3 +1,4 @@
+// Security hardening updates by Rodrigo P Gomes.
 using Microsoft.AspNetCore.Mvc;
 using SecureMessageBackend.Models;
 using SecureMessageBackend.Repositories;
@@ -12,15 +13,18 @@ public class AuthController : ControllerBase
     private readonly UserRepository _userRepository;
     private readonly PasswordService _passwordService;
     private readonly TokenService _tokenService;
+    private readonly ILogger<AuthController> _logger;
 
     public AuthController(
         UserRepository userRepository,
         PasswordService passwordService,
-        TokenService tokenService)
+        TokenService tokenService,
+        ILogger<AuthController> logger)
     {
         _userRepository = userRepository;
         _passwordService = passwordService;
         _tokenService = tokenService;
+        _logger = logger;
     }
 
     /// <summary>
@@ -66,6 +70,7 @@ public class AuthController : ControllerBase
         // Check if user already exists
         if (await _userRepository.ExistsAsync(request.Username))
         {
+            _logger.LogWarning("Registration rejected for existing username {Username}", request.Username);
             return BadRequest(new ErrorResponse { Error = "registration_failed" });
         }
 
@@ -99,12 +104,14 @@ public class AuthController : ControllerBase
         var user = await _userRepository.GetByUsernameAsync(request.Username);
         if (user == null)
         {
+            _logger.LogWarning("Login failed for unknown username {Username}", request.Username);
             return Unauthorized(new ErrorResponse { Error = "invalid_credentials" });
         }
 
         // Verify password
         if (!_passwordService.VerifyPassword(user.PasswordHash, request.Password))
         {
+            _logger.LogWarning("Login failed due to invalid password for username {Username}", request.Username);
             return Unauthorized(new ErrorResponse { Error = "invalid_credentials" });
         }
 
@@ -135,6 +142,7 @@ public class AuthController : ControllerBase
         bool invalidated = _tokenService.InvalidateToken(token);
         if (!invalidated)
         {
+            _logger.LogWarning("Logout rejected because token was invalid or expired");
             return Unauthorized(new ErrorResponse { Error = "unauthorized" });
         }
 
@@ -217,6 +225,7 @@ public class AuthController : ControllerBase
         var user = await _userRepository.GetByUsernameAsync(username);
         if (user == null || user.Role != Constants.AdminRole)
         {
+            _logger.LogWarning("Forbidden admin user listing attempt by {Username}", username);
             return StatusCode(StatusCodes.Status403Forbidden, new ErrorResponse { Error = "forbidden" });
         }
 
@@ -243,6 +252,7 @@ public class AuthController : ControllerBase
         var adminUser = await _userRepository.GetByUsernameAsync(authUsername);
         if (adminUser == null || adminUser.Role != Constants.AdminRole)
         {
+            _logger.LogWarning("Forbidden admin delete attempt by {Username} against {TargetUsername}", authUsername, username);
             return StatusCode(StatusCodes.Status403Forbidden, new ErrorResponse { Error = "forbidden" });
         }
 
@@ -282,6 +292,7 @@ public class AuthController : ControllerBase
         }
 
         _tokenService.InvalidateTokensForUser(username);
+        _logger.LogWarning("Admin {AdminUsername} deleted user {TargetUsername}", authUsername, username);
         return Ok(new StatusResponse { Status = "deleted" });
     }
 

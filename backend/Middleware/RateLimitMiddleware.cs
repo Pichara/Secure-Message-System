@@ -1,4 +1,6 @@
+// Security hardening updates by Rodrigo P Gomes.
 using SecureMessageBackend.Services;
+using System.Net;
 using System.Text.Json;
 
 namespace SecureMessageBackend.Middleware;
@@ -7,11 +9,19 @@ public class RateLimitMiddleware
 {
     private readonly RequestDelegate _next;
     private readonly RateLimiterService _rateLimiter;
+    private readonly ILogger<RateLimitMiddleware> _logger;
+    private readonly bool _trustProxyHeaders;
 
-    public RateLimitMiddleware(RequestDelegate next, RateLimiterService rateLimiter)
+    public RateLimitMiddleware(
+        RequestDelegate next,
+        RateLimiterService rateLimiter,
+        IConfiguration configuration,
+        ILogger<RateLimitMiddleware> logger)
     {
         _next = next;
         _rateLimiter = rateLimiter;
+        _logger = logger;
+        _trustProxyHeaders = bool.TryParse(configuration["TRUST_PROXY_HEADERS"], out var enabled) && enabled;
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -24,6 +34,7 @@ public class RateLimitMiddleware
             var ip = GetClientIp(context);
             if (!_rateLimiter.AllowLoginIp(ip))
             {
+                _logger.LogWarning("Rate limit exceeded for login IP {ClientIp}", ip);
                 context.Response.StatusCode = 429;
                 await context.Response.WriteAsJsonAsync(new { error = "rate_limited" });
                 return;
@@ -33,6 +44,7 @@ public class RateLimitMiddleware
 
             if (!string.IsNullOrEmpty(username) && !_rateLimiter.AllowLoginUsername(username))
             {
+                _logger.LogWarning("Rate limit exceeded for login username {Username}", username);
                 context.Response.StatusCode = 429;
                 await context.Response.WriteAsJsonAsync(new { error = "rate_limited" });
                 return;
@@ -45,6 +57,7 @@ public class RateLimitMiddleware
             var ip = GetClientIp(context);
             if (!_rateLimiter.AllowRegisterIp(ip))
             {
+                _logger.LogWarning("Rate limit exceeded for register IP {ClientIp}", ip);
                 context.Response.StatusCode = 429;
                 await context.Response.WriteAsJsonAsync(new { error = "rate_limited" });
                 return;
@@ -54,6 +67,7 @@ public class RateLimitMiddleware
 
             if (!string.IsNullOrEmpty(username) && !_rateLimiter.AllowRegisterUsername(username))
             {
+                _logger.LogWarning("Rate limit exceeded for register username {Username}", username);
                 context.Response.StatusCode = 429;
                 await context.Response.WriteAsJsonAsync(new { error = "rate_limited" });
                 return;
@@ -112,19 +126,32 @@ public class RateLimitMiddleware
 
     private string GetClientIp(HttpContext context)
     {
-        // Check for forwarded headers (proxy scenario)
-        if (context.Request.Headers.ContainsKey("X-Forwarded-For"))
+        if (_trustProxyHeaders && context.Request.Headers.ContainsKey("X-Forwarded-For"))
         {
             var forwarded = context.Request.Headers["X-Forwarded-For"].ToString();
             var ips = forwarded.Split(',');
             if (ips.Length > 0)
             {
-                return ips[0].Trim();
+                var candidate = ips[0].Trim();
+                if (!string.IsNullOrWhiteSpace(candidate))
+                {
+                    return candidate;
+                }
             }
         }
 
-        // Fall back to remote IP
-        return context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        var remoteIp = context.Connection.RemoteIpAddress;
+        if (remoteIp == null)
+        {
+            return "unknown";
+        }
+
+        if (IPAddress.IsLoopback(remoteIp))
+        {
+            return "loopback";
+        }
+
+        return remoteIp.ToString();
     }
 }
 

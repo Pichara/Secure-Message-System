@@ -1,3 +1,4 @@
+// Security hardening updates by Rodrigo P Gomes.
 namespace SecureMessageBackend.Middleware;
 
 public class CorsMiddleware
@@ -5,13 +6,22 @@ public class CorsMiddleware
     private readonly RequestDelegate _next;
     private readonly bool _allowAll;
     private readonly HashSet<string> _allowedOrigins;
+    private static readonly string[] DefaultAllowedOrigins =
+    {
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173"
+    };
 
     public CorsMiddleware(RequestDelegate next, IConfiguration configuration)
     {
         _next = next;
-        var corsOrigin = configuration["CORS_ORIGIN"] ?? "*";
+        var corsOrigin = configuration["CORS_ORIGIN"];
 
-        if (corsOrigin == "*")
+        if (string.Equals(corsOrigin, "*", StringComparison.Ordinal))
         {
             _allowAll = true;
             _allowedOrigins = new HashSet<string>();
@@ -20,7 +30,10 @@ public class CorsMiddleware
         {
             _allowAll = false;
             _allowedOrigins = new HashSet<string>(
-                corsOrigin.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                string.IsNullOrWhiteSpace(corsOrigin)
+                    ? DefaultAllowedOrigins
+                    : corsOrigin.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
+                StringComparer.OrdinalIgnoreCase
             );
         }
     }

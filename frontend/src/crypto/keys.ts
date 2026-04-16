@@ -104,11 +104,24 @@ export async function importRecipientPublicKey(publicKeyB64: string) {
 }
 
 export async function importPrivateKeyFromPkcs8B64(privateKeyPkcs8B64: string) {
-  return crypto.subtle.importKey(
-    "pkcs8",
-    new Uint8Array(b64UrlDecode(privateKeyPkcs8B64)),
-    { name: "X25519" },
-    true,
-    ["deriveBits"]
-  );
+  const rawBytes = new Uint8Array(b64UrlDecode(privateKeyPkcs8B64));
+
+  try {
+    return await crypto.subtle.importKey(
+      "pkcs8",
+      rawBytes,
+      { name: "X25519" },
+      true,
+      ["deriveBits"]
+    );
+  } catch {
+    // Legacy CLI-created accounts store the X25519 private key as raw 32-byte material.
+    return crypto.subtle.importKey(
+      "raw",
+      rawBytes,
+      { name: "X25519" },
+      true,
+      ["deriveBits"]
+    );
+  }
 }

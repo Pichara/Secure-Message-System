@@ -60,21 +60,37 @@ Current messaging support:
    - Optional query params: `with`, `limit`, `order` (`asc|desc`), `before_id`
 
 ## API Notes
-- CORS defaults to `*` and can be overridden with `CORS_ORIGIN`.
+- CORS defaults to localhost development origins (`5173`, `5174`, and `4173`) and can be overridden with `CORS_ORIGIN`.
 - Responses are JSON; errors use `{"error":"..."}`.
 - `order` and `before_id` operate on message IDs for stable pagination.
 - OpenAPI spec available at `/openapi.json` and human-friendly docs at `/api/docs`.
 
+## Environment Setup
+- Copy `.env.example` to `.env` before running the stack locally.
+- Sensitive values such as PostgreSQL credentials and bootstrap admin material are no longer hardcoded in the repository.
+- `DATABASE_URL` must be provided to the backend, directly or through `docker-compose.yml` environment expansion.
+
 ## Security Controls (Additional)
 - Input validation with bounded username/password lengths and allowed characters.
 - Registration passwords must be 8-128 characters and include at least one number and one special character.
+- TUI and CLI inputs are sent to the API as JSON, not interpolated into SQL strings.
+- Message and contact persistence use parameterized `NpgsqlCommand` queries, reducing SQL injection risk.
+- Attachment sending is an encrypted message-envelope flow, not a raw server-side file upload pipeline.
+- Attachment metadata and ciphertext are stored through parameterized queries, so the file flow does not introduce a separate SQL injection path.
 - Request body size limits to reduce abuse.
 - Basic in-memory rate limiting on login/register (per IP and username).
 - Token cleanup for expired bearer tokens.
+- Browser tokens are stored in `sessionStorage` instead of persistent `localStorage`.
+- Security headers include CSP, frame denial, referrer policy, and permissions policy.
 - Optional HSTS via `HSTS_ENABLED=true` when serving over HTTPS.
 - CLI config masks sensitive values by default; local history can be disabled.
 - Admin listing endpoints return usernames only, never password hashes, keys, or message metadata.
 - Admin delete operations are limited to non-admin accounts.
+
+## Security Review Highlights
+- `SECURITY_REVIEW.md` contains the full pentest summary, OWASP mapping, and STRIDE table.
+- TUI inputs and encrypted attachment sending were specifically checked for SQL injection exposure; no SQL injection path was identified because backend persistence uses parameterized queries.
+- Fixed hardening items include stricter CORS defaults, stronger response headers, admin-route restoration by server role, session token persistence reduction, and security event logging.
 
 ## Stack (Reference)
 - Backend: C# / ASP.NET Core 8

@@ -1,7 +1,9 @@
+// Frontend security updates by Rodrigo P Gomes and Negin Karimi.
 import { useEffect, useState } from "react";
 import { login, me } from "../api/auth";
 import { useNavigate, Link } from "react-router-dom";
 import { useAuthStore } from "../store/authStore";
+import { getToken } from "../api/client";
 import { saveEncryptedPrivateKey, savePublicKey, saveUnlockedPrivateKeyRawB64 } from "../crypto/storage";
 import { decryptPrivateKey } from "../crypto/keys";
 
@@ -174,7 +176,11 @@ export default function LoginPage() {
         }
       }
 
-      setAuth({ username: user.username, token: localStorage.getItem("token")!, role: user.role });
+      const token = getToken();
+      if (!token) {
+        throw new Error("Missing session token after login");
+      }
+      setAuth({ username: user.username, token, role: user.role });
       navigate(user.role === "admin" ? "/admin" : "/");
     } catch (e: unknown) {
       alert(e instanceof Error ? e.message : "Login failed");
