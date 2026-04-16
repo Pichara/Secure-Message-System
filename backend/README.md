@@ -1,14 +1,11 @@
-# Secure Message Backend (C++)
+# Secure Message Backend (C# / ASP.NET Core)
 
 ## Overview
-Minimal C++ backend API for the secure messaging project. This is a **starter scaffold** backed by **PostgreSQL**.
+ASP.NET Core 8 backend API for the secure messaging project, backed by PostgreSQL.
 
 ## Requirements
-- CMake 3.20+
-- C++17 compiler
-- PostgreSQL client libraries (`libpq`, `libpqxx`)
-- libsodium
-- Git (FetchContent pulls header-only dependencies)
+- .NET 8 SDK
+- PostgreSQL
 
 ## Environment Variables
 - `DATABASE_URL` (required)
@@ -17,19 +14,19 @@ Minimal C++ backend API for the secure messaging project. This is a **starter sc
 
 ## Build (local)
 ```powershell
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+dotnet restore
+dotnet build
 ```
 
 ## Run (local)
 ```powershell
 $env:DATABASE_URL="postgresql://postgres:postgres@localhost:5432/secure_message"
-./build/secure_message_backend
+dotnet run
 ```
 
 ## Docker
 ```powershell
-docker build -t secure-message-backend .
+docker build -t secure-message-backend -f Dockerfile .
 docker run -p 8080:8080 -e DATABASE_URL="postgresql://postgres:postgres@host.docker.internal:5432/secure_message" secure-message-backend
 ```
 
@@ -52,7 +49,7 @@ This starts PostgreSQL and the backend with the correct `DATABASE_URL`.
 - `GET /api/messages?with={username}`
 
 ## Security Notes (OWASP)
-- Passwords are hashed with **Argon2id** via libsodium.
+- Passwords are hashed with **Argon2id**.
 - New registrations require passwords that are 8-128 characters long and include at least one number and one special character.
 - Queries are parameterized to prevent SQL injection.
 - Tokens are short-lived (1 hour) and stored in memory (demo).

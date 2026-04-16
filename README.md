@@ -75,6 +75,6 @@ Current messaging support:
 - Admin-only listing endpoints must return usernames only, never password hashes, keys, or message metadata.
 
 ## Stack (Reference)
-- Backend: C++ (cpp‑httplib, nlohmann/json, libpqxx, libsodium)
+- Backend: C# / ASP.NET Core 8
 - DB: PostgreSQL
 - CLI: Python (Typer, Requests, Cryptography, Textual)
