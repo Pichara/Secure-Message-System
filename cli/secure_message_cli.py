@@ -41,8 +41,7 @@ HISTORY_FILE = STATE_DIR / "history.jsonl"
 
 DEFAULT_BACKEND_URL = "http://localhost:8080"
 PBKDF2_ITERATIONS = 200_000
-MAX_ATTACHMENT_BYTES = 128 * 1024
-ADMIN_USERNAME = "ADMIN"
+MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
 PASSWORD_POLICY_MESSAGE = (
     "Password must be 8-128 characters and include at least one number "
     "and one special character."
@@ -189,13 +188,13 @@ def _auth_role(auth: dict) -> str:
 
 
 def _admin_session_only_lists_users(auth: dict) -> bool:
-    return _auth_role(auth) == "admin" and str(auth.get("username") or "") == ADMIN_USERNAME
+    return _auth_role(auth) == "admin"
 
 
 def _require_non_admin_messaging(auth: dict) -> None:
     if _admin_session_only_lists_users(auth):
         typer.secho(
-            "ADMIN is limited to listing users. Run 'admin users' instead.",
+            "Admin sessions are limited to listing users. Run 'admin users' instead.",
             fg=typer.colors.RED,
         )
         raise typer.Exit(1)
@@ -581,7 +580,7 @@ def _write_attachment_file(output_path: Path, name: str, raw_bytes: bytes) -> Pa
     target = output_path
     if output_path.exists() and output_path.is_dir():
         target = output_path / name
-    elif output_path.suffix == "" and str(output_path).endswith((os.sep, "/")):
+    elif output_path.suffix == "":
         target = output_path / name
 
     target.parent.mkdir(parents=True, exist_ok=True)

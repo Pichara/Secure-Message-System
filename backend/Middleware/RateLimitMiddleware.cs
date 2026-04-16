@@ -1,4 +1,5 @@
 using SecureMessageBackend.Services;
+using System.Text.Json;
 
 namespace SecureMessageBackend.Middleware;
 
@@ -28,25 +29,7 @@ public class RateLimitMiddleware
                 return;
             }
 
-            var username = context.Request.Form["username"].ToString();
-            if (string.IsNullOrEmpty(username))
-            {
-                // Try reading from JSON body
-                try
-                {
-                    context.Request.EnableBuffering();
-                    using var reader = new StreamReader(context.Request.Body, leaveOpen: true);
-                    var body = await reader.ReadToEndAsync();
-                    context.Request.Body.Position = 0;
-
-                    var json = System.Text.Json.JsonDocument.Parse(body);
-                    if (json.RootElement.TryGetProperty("username", out var usernameElement))
-                    {
-                        username = usernameElement.GetString() ?? string.Empty;
-                    }
-                }
-                catch { }
-            }
+            var username = await TryGetUsernameAsync(context);
 
             if (!string.IsNullOrEmpty(username) && !_rateLimiter.AllowLoginUsername(username))
             {
@@ -67,25 +50,7 @@ public class RateLimitMiddleware
                 return;
             }
 
-            var username = context.Request.Form["username"].ToString();
-            if (string.IsNullOrEmpty(username))
-            {
-                // Try reading from JSON body
-                try
-                {
-                    context.Request.EnableBuffering();
-                    using var reader = new StreamReader(context.Request.Body, leaveOpen: true);
-                    var body = await reader.ReadToEndAsync();
-                    context.Request.Body.Position = 0;
-
-                    var json = System.Text.Json.JsonDocument.Parse(body);
-                    if (json.RootElement.TryGetProperty("username", out var usernameElement))
-                    {
-                        username = usernameElement.GetString() ?? string.Empty;
-                    }
-                }
-                catch { }
-            }
+            var username = await TryGetUsernameAsync(context);
 
             if (!string.IsNullOrEmpty(username) && !_rateLimiter.AllowRegisterUsername(username))
             {
@@ -96,6 +61,53 @@ public class RateLimitMiddleware
         }
 
         await _next(context);
+    }
+
+    private static async Task<string> TryGetUsernameAsync(HttpContext context)
+    {
+        if (context.Request.HasFormContentType)
+        {
+            try
+            {
+                var form = await context.Request.ReadFormAsync();
+                var username = form["username"].ToString();
+                if (!string.IsNullOrWhiteSpace(username))
+                {
+                    return username;
+                }
+            }
+            catch
+            {
+                // Ignore malformed form bodies and fall back to JSON parsing.
+            }
+        }
+
+        try
+        {
+            context.Request.EnableBuffering();
+            context.Request.Body.Position = 0;
+
+            using var reader = new StreamReader(context.Request.Body, leaveOpen: true);
+            var body = await reader.ReadToEndAsync();
+            context.Request.Body.Position = 0;
+
+            if (string.IsNullOrWhiteSpace(body))
+            {
+                return string.Empty;
+            }
+
+            using var json = JsonDocument.Parse(body);
+            if (json.RootElement.TryGetProperty("username", out var usernameElement))
+            {
+                return usernameElement.GetString() ?? string.Empty;
+            }
+        }
+        catch
+        {
+            context.Request.Body.Position = 0;
+        }
+
+        return string.Empty;
     }
 
     private string GetClientIp(HttpContext context)

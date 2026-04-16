@@ -50,13 +50,13 @@ public class PasswordService
         {
             // Parse PHC format: $argon2id$v=19$m=65536,t=3,p=2$<base64 salt>$<base64 hash>
             var parts = hash.Split('$');
-            if (parts.Length < 6 || parts[1] != "argon2id")
+            if (parts.Length != 6 || parts[1] != "argon2id")
             {
                 return false;
             }
 
-            // Extract parameters (optional, for parsing)
-            var paramPart = parts[4].Split(',');
+            // Extract parameters from the PHC parameter segment.
+            var paramPart = parts[3].Split(',');
             int memory = Argon2Memory;
             int iterations = Argon2Iterations;
             int parallelism = Argon2Parallelism;
@@ -75,8 +75,8 @@ public class PasswordService
                 }
             }
 
-            string saltBase64 = parts[5];
-            string hashBase64 = parts[6];
+            string saltBase64 = parts[4];
+            string hashBase64 = parts[5];
 
             // Decode base64 (PHC uses standard base64 without padding)
             byte[] salt = Base64UrlDecode(saltBase64);

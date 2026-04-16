@@ -94,7 +94,7 @@ public class MessagesController : ControllerBase
         [FromQuery] string? with = null,
         [FromQuery] int? limit = null,
         [FromQuery] string? order = null,
-        [FromQuery] int? beforeId = null)
+        [FromQuery(Name = "before_id")] int? beforeId = null)
     {
         string? username = GetAuthenticatedUsername();
         if (string.IsNullOrEmpty(username))

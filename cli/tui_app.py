@@ -7,13 +7,16 @@ from typing import Optional
 
 from textual.app import App, ComposeResult
 from textual import work
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
+from textual.timer import Timer
 from textual.widgets import Button, Footer, Header, Input, ListItem, ListView, RichLog, Static
 
 from secure_message_cli import (
+    STATE_DIR,
     _append_history,
     _auth_valid,
+    _b64decode,
     _backend_url,
     _build_attachment_envelope,
     _decrypt_message,
@@ -31,6 +34,7 @@ from secure_message_cli import (
     _serialize_public_key,
     _state,
     _save_state,
+    _write_attachment_file,
 )
 
 
@@ -43,11 +47,10 @@ class AuthState:
 
 
 PASSWORD_RULE_HINT = "Password must be 8-128 characters and include at least one number and one special character."
-ADMIN_USERNAME = "ADMIN"
 
 
 def _is_dedicated_admin(auth: AuthState) -> bool:
-    return auth.role == "admin" and auth.username == ADMIN_USERNAME
+    return auth.role == "admin"
 
 
 def _registration_password_message(password: str) -> Optional[str]:
@@ -148,6 +151,151 @@ class InputDialog(ModalScreen[str]):
         self.dismiss(value)
 
 
+class NewChatDialog(ModalScreen[str]):
+    """Centered modal that validates the target username before closing."""
+
+    CSS = """
+    #new-chat-dialog {
+        width: 60%;
+        min-width: 40;
+        height: auto;
+        padding: 1 2;
+        border: round #4c4c4c;
+    }
+    #new-chat-status {
+        width: 100%;
+        content-align: center middle;
+        color: #ffb0b0;
+        margin-bottom: 1;
+    }
+    #new-chat-title {
+        width: 100%;
+        content-align: center middle;
+    }
+    #new-chat-actions {
+        height: auto;
+        margin-top: 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Container(id="new-chat-dialog"):
+            yield Static("", id="new-chat-status")
+            yield Static("Start chat with", id="new-chat-title")
+            yield Input(placeholder="username", id="new-chat-input")
+            with Horizontal(id="new-chat-actions"):
+                yield Button("OK", id="ok", variant="primary")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#new-chat-input", Input).focus()
+
+    def _set_status(self, message: str) -> None:
+        self.query_one("#new-chat-status", Static).update(message)
+
+    def _submit(self) -> None:
+        username = self.query_one("#new-chat-input", Input).value.strip()
+        if not username:
+            self._set_status("Username required.")
+            return
+
+        state = _state()
+        username = _resolve_alias(state, username)
+        auth = state.get("auth") or {}
+        resp = _request(
+            "GET",
+            f"{_backend_url(state)}/api/users/{username}/public-key",
+            token=auth.get("token"),
+        )
+        if resp.status_code == 200:
+            self.dismiss(username)
+            return
+        if resp.status_code == 404:
+            self._set_status("User not found!")
+            return
+        if resp.status_code == 401:
+            self._set_status("Session expired. Please login again.")
+            return
+        self._set_status(f"Failed to resolve user: {resp.text}")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "ok":
+            self._submit()
+            return
+        self.dismiss("")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit()
+
+
+class AttachFileDialog(ModalScreen[str]):
+    """Centered modal that validates the selected file path before closing."""
+
+    CSS = """
+    #attach-file-dialog {
+        width: 60%;
+        min-width: 40;
+        height: auto;
+        padding: 1 2;
+        border: round #4c4c4c;
+    }
+    #attach-file-status {
+        width: 100%;
+        content-align: center middle;
+        color: #ffb0b0;
+        margin-bottom: 1;
+    }
+    #attach-file-title {
+        width: 100%;
+        content-align: center middle;
+    }
+    #attach-file-actions {
+        height: auto;
+        margin-top: 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Container(id="attach-file-dialog"):
+            yield Static("", id="attach-file-status")
+            yield Static("Attach file", id="attach-file-title")
+            yield Input(placeholder="C:\\path\\to\\file.ext", id="attach-file-input")
+            with Horizontal(id="attach-file-actions"):
+                yield Button("OK", id="ok", variant="primary")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#attach-file-input", Input).focus()
+
+    def _set_status(self, message: str) -> None:
+        self.query_one("#attach-file-status", Static).update(message)
+
+    def _submit(self) -> None:
+        raw_path = self.query_one("#attach-file-input", Input).value.strip()
+        if not raw_path:
+            self._set_status("File path required.")
+            return
+
+        file_path = Path(raw_path).expanduser()
+        if not file_path.exists():
+            self._set_status("File not found.")
+            return
+        if not file_path.is_file():
+            self._set_status("Path must be a file.")
+            return
+
+        self.dismiss(str(file_path))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "ok":
+            self._submit()
+            return
+        self.dismiss("")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit()
+
+
 class AuthScreen(Screen):
     """Login/register screen that also seeds local state with key material."""
 
@@ -227,11 +375,13 @@ class AuthScreen(Screen):
             "public_key": me["public_key"],
             "encrypted_private_key": me["encrypted_private_key"],
         }
-        try:
-            private_key = _load_private_key_from_state(state, password)
-        except Exception:
-            self._set_status("Login ok, but failed to decrypt the local private key.")
-            return None
+        private_key = None
+        if role != "admin":
+            try:
+                private_key = _load_private_key_from_state(state, password)
+            except Exception:
+                self._set_status("Login ok, but failed to decrypt the local private key.")
+                return None
         _save_state(state)
         return AuthState(token=token, username=username, role=role, private_key=private_key)
 
@@ -452,6 +602,18 @@ class MessageScreen(Screen):
         width: 70%;
         border: round #4c4c4c;
     }
+    #message-log {
+        height: 1fr;
+    }
+    .message-line {
+        width: 100%;
+        padding: 0 1;
+    }
+    .message-attachment {
+        width: 100%;
+        margin: 0 1 1 1;
+        text-align: left;
+    }
     #compose-box {
         height: auto;
         margin-top: 1;
@@ -477,10 +639,12 @@ class MessageScreen(Screen):
         self.auth = auth
         self.private_key = auth.private_key
         self.current_with: Optional[str] = None
+        self._chat_refresh_timer: Timer | None = None
+        self._last_conversation_signature: tuple[int, str] | None = None
 
     def _can_view_admin_users(self) -> bool:
-        """Only the dedicated ADMIN account should see the admin user list affordance."""
-        return self.auth.role == "admin" and self.auth.username == ADMIN_USERNAME
+        """Any admin session can open the read-only user list view."""
+        return self.auth.role == "admin"
 
     def compose(self) -> ComposeResult:
         """Render sidebar contact list, message log, and compose box."""
@@ -491,17 +655,17 @@ class MessageScreen(Screen):
                 yield Static("", id="session-meta")
                 with Horizontal(id="contact-actions"):
                     yield Button("New chat", id="new-chat", variant="primary")
-                    yield Button("Refresh", id="refresh")
                     if self._can_view_admin_users():
                         yield Button("Users", id="admin-users")
                 yield ListView(id="contact-list")
                 yield Static("No contact selected.", id="details")
             with Vertical(id="messages"):
-                yield RichLog(id="message-log", wrap=True)
+                yield VerticalScroll(id="message-log")
                 with Container(id="compose-box"):
                     yield Input(placeholder="Type message and press Enter", id="compose")
                     with Horizontal(id="compose-actions"):
                         yield Button("Attach file", id="attach-file")
+                        yield Button("Refresh", id="refresh")
                         yield Button("Logout", id="logout")
         yield Static("", id="status")
         yield Footer()
@@ -511,6 +675,12 @@ class MessageScreen(Screen):
         self.query_one("#compose", Input).disabled = True
         self._update_session_meta()
         self._refresh_contacts()
+        self._chat_refresh_timer = self.set_interval(2.0, self._auto_refresh_active_chat, pause=False)
+
+    def on_unmount(self) -> None:
+        if self._chat_refresh_timer is not None:
+            self._chat_refresh_timer.stop()
+            self._chat_refresh_timer = None
 
     def _set_status(self, message: str) -> None:
         """Update the transient status line at the bottom of the screen."""
@@ -574,11 +744,10 @@ class MessageScreen(Screen):
         if not contacts:
             self._set_status("No contacts yet. Press 'n' to add one.")
 
-    def _render_conversation(self, with_user: str) -> None:
-        """Fetch messages with `with_user` and render decrypted/plaintext view when possible."""
+    def _fetch_conversation_messages(self, with_user: str) -> Optional[list[dict]]:
+        """Fetch the current conversation payload from the backend."""
         state = _state()
         auth = state.get("auth") or {}
-        history = _load_history()
 
         resp = _request(
             "GET",
@@ -595,21 +764,63 @@ class MessageScreen(Screen):
             else:
                 self._set_status(f"Failed to load messages: {resp.text}")
             self.query_one("#compose", Input).disabled = True
-            return
+            return None
 
         messages = resp.json()
         messages.sort(key=lambda msg: msg.get("created_at", ""))
-        log = self.query_one("#message-log", RichLog)
-        log.clear()
+        return messages
+
+    def _conversation_signature(self, messages: list[dict]) -> tuple[int, str]:
         if not messages:
-            log.write("No messages yet. Send one below.")
+            return (0, "")
+        last = messages[-1]
+        return (len(messages), str(last.get("created_at", "")))
+
+    def _render_message_widget(self, message_line: str, parsed_content: dict, message_id: object) -> None:
+        log = self.query_one("#message-log", VerticalScroll)
+        if parsed_content.get("kind") == "attachment" and parsed_content.get("bytes_b64"):
+            button = Button(message_line, id=f"attachment-msg-{message_id}", classes="message-attachment")
+            button.attachment_content = parsed_content
+            log.mount(button)
+            return
+        log.mount(Static(message_line, classes="message-line"))
+
+    def _save_attachment_from_content(self, content: dict) -> Optional[Path]:
+        try:
+            raw_bytes = _b64decode(str(content.get("bytes_b64") or ""))
+        except Exception:
+            self._set_status("Attachment payload is invalid.")
+            return None
+
+        download_dir = Path.home() / "Downloads"
+        saved_path = _write_attachment_file(download_dir, str(content.get("name") or "attachment.bin"), raw_bytes)
+        self._set_status(f"Attachment saved to {saved_path}.")
+        return saved_path
+
+    def _render_conversation(self, with_user: str, messages: Optional[list[dict]] = None, *, update_status: bool = True) -> None:
+        """Render decrypted/plaintext view for the active conversation."""
+        if messages is None:
+            messages = self._fetch_conversation_messages(with_user)
+            if messages is None:
+                return
+
+        state = _state()
+        auth = state.get("auth") or {}
+        history = _load_history()
+        history_map = history if isinstance(history, dict) else {}
+        self._last_conversation_signature = self._conversation_signature(messages)
+        log = self.query_one("#message-log", VerticalScroll)
+        for child in list(log.children):
+            child.remove()
+        if not messages:
+            log.mount(Static("No messages yet. Send one below.", classes="message-line"))
         for msg in messages:
             sender = msg.get("sender", "unknown")
             recipient = msg.get("recipient", "unknown")
             created_at = msg.get("created_at", "unknown")
             if recipient == auth.get("username"):
                 if self.private_key is None:
-                    plaintext = "[message unavailable]"
+                    parsed_content = {"kind": "text", "display": "[message unavailable]"}
                 else:
                     try:
                         plaintext = _decrypt_message(
@@ -618,24 +829,49 @@ class MessageScreen(Screen):
                             msg.get("encrypted_key", ""),
                             self.private_key,
                         )
+                        parsed_content = _message_content(plaintext)
                     except Exception:
-                        plaintext = "[decryption failed]"
+                        parsed_content = {"kind": "text", "display": "[decryption failed]"}
             else:
                 # Sent-message plaintext is only stored locally (optional); server stores ciphertext only.
-                plaintext = _history_display(history, msg.get("id"))
-            log.write(
+                parsed_content = history_map.get(str(msg.get("id"))) or {
+                    "kind": "text",
+                    "display": _history_display(history_map, msg.get("id")),
+                }
+            self._render_message_widget(
                 _format_message_log_line(
                     created_at,
                     sender,
                     recipient,
-                    _format_plaintext(plaintext),
-                )
+                    str(parsed_content.get("display") or ""),
+                ),
+                parsed_content,
+                msg.get("id"),
             )
 
         self.query_one("#compose", Input).disabled = False
         self.query_one("#compose", Input).focus()
         self._render_contact_details(with_user, messages)
-        self._set_status(f"Chatting with {with_user}")
+        if update_status:
+            self._set_status(f"Chatting with {with_user}")
+
+    def _auto_refresh_active_chat(self) -> None:
+        """Poll the active conversation and update the log when new messages arrive."""
+        if not self.current_with:
+            return
+        if self.screen is not self:
+            return
+
+        messages = self._fetch_conversation_messages(self.current_with)
+        if messages is None:
+            return
+
+        signature = self._conversation_signature(messages)
+        if signature == self._last_conversation_signature:
+            return
+
+        self._render_conversation(self.current_with, messages, update_status=False)
+        self._set_status(f"New messages in chat with {self.current_with}.")
 
     def _shorten(self, value: str, keep: int = 6) -> str:
         """Return a short fingerprint-like rendering for long identifiers (e.g., public keys)."""
@@ -702,6 +938,10 @@ class MessageScreen(Screen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle on-screen buttons (keyboard shortcuts are handled by Textual actions)."""
+        attachment_content = getattr(event.button, "attachment_content", None)
+        if attachment_content is not None:
+            self._save_attachment_from_content(attachment_content)
+            return
         if event.button.id == "new-chat":
             self.action_new_chat()
             return
@@ -721,52 +961,32 @@ class MessageScreen(Screen):
     @work(exclusive=True)
     async def action_new_chat(self) -> None:
         """Prompt for a user, validate they exist, add to contacts, and open the chat."""
-        while True:
-            username = await self.app.push_screen(InputDialog("Start chat with:", "username"), wait_for_dismiss=True)
-            if not username:
-                return
-            state = _state()
-            username = _resolve_alias(state, username)
-            auth = state.get("auth") or {}
-
-            # Existence check: /public-key doubles as a "does this user exist" lookup.
-            resp = _request(
-                "GET",
-                f"{_backend_url(state)}/api/users/{username}/public-key",
-                token=auth.get("token"),
-            )
-            if resp.status_code != 200:
-                if resp.status_code == 401:
-                    self._set_status("Session expired. Please login again.")
-                    self.app.push_screen(AuthScreen())
-                    return
-                if resp.status_code == 404:
-                    self._set_status("User not found.")
-                    continue
-                self._set_status(f"Failed to resolve user: {resp.text}")
-                return
-
-            save_resp = _request(
-                "POST",
-                f"{_backend_url(state)}/api/contacts",
-                token=auth.get("token"),
-                json={"alias": username, "username": username},
-            )
-            if save_resp.status_code != 201:
-                self._set_status(f"Failed to save contact: {save_resp.text}")
-                return
-            self._set_status(f"Added {username} to contacts.")
-            self._refresh_contacts()
-
-            list_view = self.query_one("#contact-list", ListView)
-            for index, item in enumerate(list_view.children):
-                if getattr(item, "user", None) == username:
-                    list_view.index = index
-                    break
-
-            self.current_with = username
-            self._render_conversation(username)
+        username = await self.app.push_screen(NewChatDialog(), wait_for_dismiss=True)
+        if not username:
             return
+
+        state = _state()
+        auth = state.get("auth") or {}
+        save_resp = _request(
+            "POST",
+            f"{_backend_url(state)}/api/contacts",
+            token=auth.get("token"),
+            json={"alias": username, "username": username},
+        )
+        if save_resp.status_code != 201:
+            self._set_status(f"Failed to save contact: {save_resp.text}")
+            return
+        self._set_status(f"Added {username} to contacts.")
+        self._refresh_contacts()
+
+        list_view = self.query_one("#contact-list", ListView)
+        for index, item in enumerate(list_view.children):
+            if getattr(item, "user", None) == username:
+                list_view.index = index
+                break
+
+        self.current_with = username
+        self._render_conversation(username)
 
     def action_refresh(self) -> None:
         """Reload contacts and, if selected, re-fetch the active conversation."""
@@ -776,32 +996,25 @@ class MessageScreen(Screen):
 
     @work(exclusive=True)
     async def action_attach_file(self) -> None:
-        """Prompt for a file path and optional caption, then send it as an encrypted attachment envelope."""
+        """Prompt for a file path and send it immediately as an encrypted attachment envelope."""
         if not self.current_with:
             self._set_status("Select a conversation before attaching a file.")
             return
 
-        path_value = await self.app.push_screen(
-            InputDialog("Attach file", "C:\\path\\to\\file.ext"),
-            wait_for_dismiss=True,
-        )
+        path_value = await self.app.push_screen(AttachFileDialog(), wait_for_dismiss=True)
         if not path_value:
             return
 
-        caption = await self.app.push_screen(
-            InputDialog("Optional caption", "caption"),
-            wait_for_dismiss=True,
-        )
-
         try:
-            message, _ = _build_attachment_envelope(Path(path_value).expanduser(), caption or "")
+            message, attachment_meta = _build_attachment_envelope(Path(path_value), "")
         except ValueError as exc:
             self._set_status(str(exc))
             return
         except OSError as exc:
             self._set_status(f"Failed to read attachment: {exc}")
             return
-        self._send_payload(message)
+        if self._send_payload(message):
+            self._set_status(f"Attachment sent: {attachment_meta['name']}.")
 
     @work(exclusive=True)
     async def action_admin_users(self) -> None:

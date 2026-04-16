@@ -48,7 +48,7 @@ def test_send_is_blocked_for_dedicated_admin(tmp_path, monkeypatch):
     result = runner.invoke(cli.app, ["send", "bob", "hello"])
 
     assert result.exit_code == 1
-    assert "ADMIN is limited to listing users." in result.stdout
+    assert "Admin sessions are limited to listing users." in result.stdout
 
 
 def test_shell_for_dedicated_admin_only_shows_directory_actions(tmp_path, monkeypatch):

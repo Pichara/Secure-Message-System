@@ -217,7 +217,7 @@ public class AuthController : ControllerBase
         var user = await _userRepository.GetByUsernameAsync(username);
         if (user == null || user.Role != Constants.AdminRole)
         {
-            return Forbid();
+            return StatusCode(StatusCodes.Status403Forbidden, new ErrorResponse { Error = "forbidden" });
         }
 
         var usernames = await _userRepository.GetAllUsernamesAsync();

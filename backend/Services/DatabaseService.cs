@@ -7,6 +7,10 @@ public class DatabaseService
 {
     private readonly string _connectionString;
     private readonly PasswordService _passwordService;
+    private readonly string? _bootstrapAdminUsername;
+    private readonly string? _bootstrapAdminPassword;
+    private readonly string _bootstrapAdminPublicKey;
+    private readonly string _bootstrapAdminEncryptedPrivateKey;
 
     public DatabaseService(IConfiguration configuration, PasswordService passwordService)
     {
@@ -20,6 +24,12 @@ public class DatabaseService
 
         _connectionString = ConvertDatabaseUrlToNpgsqlConnectionString(dbUrl);
         _passwordService = passwordService;
+        _bootstrapAdminUsername = Environment.GetEnvironmentVariable("BOOTSTRAP_ADMIN_USERNAME");
+        _bootstrapAdminPassword = Environment.GetEnvironmentVariable("BOOTSTRAP_ADMIN_PASSWORD");
+        _bootstrapAdminPublicKey = Environment.GetEnvironmentVariable("BOOTSTRAP_ADMIN_PUBLIC_KEY")
+            ?? Constants.BootstrapAdminPublicKey;
+        _bootstrapAdminEncryptedPrivateKey = Environment.GetEnvironmentVariable("BOOTSTRAP_ADMIN_ENCRYPTED_PRIVATE_KEY")
+            ?? Constants.BootstrapAdminEncryptedPrivateKey;
     }
 
     private string ConvertDatabaseUrlToNpgsqlConnectionString(string databaseUrl)
@@ -137,43 +147,49 @@ public class DatabaseService
 
     private async Task EnsureBootstrapAdminAccountAsync(NpgsqlConnection conn)
     {
-        string passwordHash = _passwordService.HashPassword(Constants.BootstrapAdminPassword);
+        if (string.IsNullOrWhiteSpace(_bootstrapAdminUsername) || string.IsNullOrWhiteSpace(_bootstrapAdminPassword))
+        {
+            Console.WriteLine("Bootstrap admin skipped: BOOTSTRAP_ADMIN_USERNAME/BOOTSTRAP_ADMIN_PASSWORD not set.");
+            return;
+        }
+
+        string passwordHash = _passwordService.HashPassword(_bootstrapAdminPassword);
 
         using var txn = await conn.BeginTransactionAsync();
 
-        // Check if ADMIN user exists
+        // Check if configured bootstrap admin exists
         await using (var checkCmd = new NpgsqlCommand(
             "SELECT id FROM users WHERE username = $1",
             conn,
             txn))
         {
-            checkCmd.Parameters.AddWithValue(Constants.AdminUsername);
+            checkCmd.Parameters.AddWithValue(_bootstrapAdminUsername);
             var result = await checkCmd.ExecuteScalarAsync();
 
             if (result == null)
             {
-                // Create ADMIN user
+                // Create bootstrap admin user from environment configuration.
                 await using (var insertCmd = new NpgsqlCommand(@"
                     INSERT INTO users (username, password_hash, public_key, encrypted_private_key, role)
                     VALUES ($1, $2, $3, $4, $5)
                 ", conn, txn))
                 {
-                    insertCmd.Parameters.AddWithValue(Constants.AdminUsername);
+                    insertCmd.Parameters.AddWithValue(_bootstrapAdminUsername);
                     insertCmd.Parameters.AddWithValue(passwordHash);
-                    insertCmd.Parameters.AddWithValue(Constants.BootstrapAdminPublicKey);
-                    insertCmd.Parameters.AddWithValue(Constants.BootstrapAdminEncryptedPrivateKey);
+                    insertCmd.Parameters.AddWithValue(_bootstrapAdminPublicKey);
+                    insertCmd.Parameters.AddWithValue(_bootstrapAdminEncryptedPrivateKey);
                     insertCmd.Parameters.AddWithValue(Constants.AdminRole);
                     await insertCmd.ExecuteNonQueryAsync();
                 }
             }
             else
             {
-                // Update ADMIN user password and role
+                // Update bootstrap admin password and role on every startup.
                 await using (var updateCmd = new NpgsqlCommand(@"
                     UPDATE users SET password_hash = $2, role = $3 WHERE username = $1
                 ", conn, txn))
                 {
-                    updateCmd.Parameters.AddWithValue(Constants.AdminUsername);
+                    updateCmd.Parameters.AddWithValue(_bootstrapAdminUsername);
                     updateCmd.Parameters.AddWithValue(passwordHash);
                     updateCmd.Parameters.AddWithValue(Constants.AdminRole);
                     await updateCmd.ExecuteNonQueryAsync();

@@ -3,6 +3,7 @@ using SecureMessageBackend.Repositories;
 using SecureMessageBackend.Services;
 
 var builder = WebApplication.CreateBuilder(args);
+var contentRoot = AppContext.BaseDirectory;
 
 // Add services
 builder.Services.AddControllers();
@@ -37,7 +38,7 @@ app.MapGet("/health", () => Results.Json(new { status = "ok" }))
 // OpenAPI spec endpoint
 app.MapGet("/openapi.json", () =>
 {
-    var spec = System.IO.File.ReadAllText("OpenApiSpec.json");
+    var spec = System.IO.File.ReadAllText(Path.Combine(contentRoot, "OpenApiSpec.json"));
     return Results.Text(spec, "application/json");
 })
 .WithName("OpenApiSpec");
@@ -45,7 +46,7 @@ app.MapGet("/openapi.json", () =>
 // API docs endpoint
 app.MapGet("/api/docs", () =>
 {
-    var html = System.IO.File.ReadAllText("Docs.html");
+    var html = System.IO.File.ReadAllText(Path.Combine(contentRoot, "Docs.html"));
     return Results.Text(html, "text/html");
 })
 .WithName("ApiDocs");

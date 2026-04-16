@@ -53,8 +53,6 @@ constexpr size_t kMaxCiphertextLen = 1536 * 1024;
 constexpr size_t kMaxIvLen = 128;
 constexpr const char* kUserRole = "user";
 constexpr const char* kAdminRole = "admin";
-constexpr const char* kAdminUsername = "ADMIN";
-constexpr const char* kBootstrapAdminPassword = "Password!123";
 constexpr const char* kBootstrapAdminPublicKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 constexpr const char* kBootstrapAdminEncryptedPrivateKey =
     R"({"ciphertext":"","salt":"","nonce":""})";
@@ -263,8 +261,21 @@ bool IsAdminRole(const std::string& role) {
 }
 
 void EnsureBootstrapAdminAccount(pqxx::connection& conn) {
+  const char* username_env = std::getenv("BOOTSTRAP_ADMIN_USERNAME");
+  const char* password_env = std::getenv("BOOTSTRAP_ADMIN_PASSWORD");
+  if (!username_env || !*username_env || !password_env || !*password_env) {
+    std::fprintf(stderr,
+                 "Bootstrap admin skipped: BOOTSTRAP_ADMIN_USERNAME/BOOTSTRAP_ADMIN_PASSWORD not set.\n");
+    return;
+  }
+
+  const std::string username(username_env);
+  const std::string password(password_env);
+  const std::string public_key = GetEnvOrDefault("BOOTSTRAP_ADMIN_PUBLIC_KEY", kBootstrapAdminPublicKey);
+  const std::string encrypted_private_key =
+      GetEnvOrDefault("BOOTSTRAP_ADMIN_ENCRYPTED_PRIVATE_KEY", kBootstrapAdminEncryptedPrivateKey);
+
   char hash[crypto_pwhash_STRBYTES];
-  const std::string password = kBootstrapAdminPassword;
   if (crypto_pwhash_str(
           hash,
           password.c_str(),
@@ -277,21 +288,21 @@ void EnsureBootstrapAdminAccount(pqxx::connection& conn) {
   pqxx::work txn(conn);
   pqxx::result existing = txn.exec_params(
       "SELECT id FROM users WHERE username = $1",
-      std::string(kAdminUsername));
+      username);
 
   if (existing.empty()) {
     txn.exec_params(
         "INSERT INTO users (username, password_hash, public_key, encrypted_private_key, role) "
         "VALUES ($1, $2, $3, $4, $5)",
-        std::string(kAdminUsername),
+        username,
         std::string(hash),
-        std::string(kBootstrapAdminPublicKey),
-        std::string(kBootstrapAdminEncryptedPrivateKey),
+        public_key,
+        encrypted_private_key,
         std::string(kAdminRole));
   } else {
     txn.exec_params(
         "UPDATE users SET password_hash = $2, role = $3 WHERE username = $1",
-        std::string(kAdminUsername),
+        username,
         std::string(hash),
         std::string(kAdminRole));
   }

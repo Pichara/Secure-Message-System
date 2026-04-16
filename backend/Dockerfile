@@ -24,5 +24,7 @@ ENV PORT=8080
 
 # Copy the published output from the build stage
 COPY --from=build /app/publish ./
+COPY --from=build /app/Docs.html ./
+COPY --from=build /app/OpenApiSpec.json ./
 
 CMD ["dotnet", "SecureMessageBackend.dll"]

@@ -14,4 +14,9 @@
     <PackageReference Include="System.Text.Json" Version="8.0.5" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Content Update="Docs.html" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Update="OpenApiSpec.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
